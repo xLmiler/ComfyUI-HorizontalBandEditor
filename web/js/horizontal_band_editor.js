@@ -3,7 +3,7 @@ import { api } from "../../scripts/api.js";
 
 const NODE_NAME = "HorizontalBandEditor";
 const REGION_LABELS = [..."ABCDEFGHIJKL"];
-const PREVIEW_MIN_HEIGHT = 220;
+const PREVIEW_HEIGHT = 320;
 
 function getWidget(node, ...names) {
     return node.widgets?.find((w) => names.includes(w.name));
@@ -72,20 +72,6 @@ function makeViewUrl(filename) {
     return api.apiURL(`/view?${params.toString()}`);
 }
 
-function safeLayoutHeight(widget, node) {
-    if (!widget || widget.hidden || widget.computedDisabled) return 0;
-    try {
-        const result = widget.computeLayoutSize?.(node);
-        if (result && Number.isFinite(Number(result.minHeight))) return Number(result.minHeight);
-    } catch (_) {}
-    try {
-        const result = widget.computeSize?.(node.size?.[0]);
-        if (Array.isArray(result) && Number.isFinite(Number(result[1]))) return Number(result[1]);
-    } catch (_) {}
-    if (Number.isFinite(Number(widget.computedHeight))) return Number(widget.computedHeight);
-    if (Number.isFinite(Number(widget.height))) return Number(widget.height);
-    return 24;
-}
 
 function installNativeVisibility(node) {
     const countW = getWidget(node, "截面数量", "region_count");
@@ -478,19 +464,6 @@ function addPreviewWidget(node) {
         img.src = `${makeViewUrl(connected.filename)}&rand=${Date.now()}`;
     }
 
-    function desiredPreviewHeight() {
-        const widgets = node.widgets || [];
-        let used = 0;
-        for (const widget of widgets) {
-            if (!widget || widget === node._hbePreviewWidget) continue;
-            used += safeLayoutHeight(widget, node);
-        }
-        // 标题栏、输入/输出插槽、各 widget 间距预留。
-        const chrome = 105;
-        const available = Number(node.size?.[1] || 520) - used - chrome;
-        return Math.max(PREVIEW_MIN_HEIGHT, Math.floor(available));
-    }
-
     const previewWidget = node.addDOMWidget(
         "编辑预览",
         "horizontal_band_preview",
@@ -499,8 +472,11 @@ function addPreviewWidget(node) {
             serialize: false,
             hideOnZoom: false,
             margin: 6,
-            getHeight: () => desiredPreviewHeight(),
-            getMaxHeight: () => desiredPreviewHeight(),
+            // 预览高度必须独立于 node.size，否则 DOM widget 的高度会反过来
+            // 参与节点最小高度计算，形成“节点变高 -> 预览变高 -> 节点再变高”的递归增长。
+            getHeight: () => PREVIEW_HEIGHT,
+            getMinHeight: () => PREVIEW_HEIGHT,
+            getMaxHeight: () => PREVIEW_HEIGHT,
             afterResize: () => requestAnimationFrame(draw),
             onDraw: () => ensureSource(false),
         }
@@ -556,10 +532,12 @@ app.registerExtension({
         };
 
         requestAnimationFrame(() => {
-            node.setSize?.([
-                Math.max(Number(node.size?.[0] || 360), 360),
-                Math.max(Number(node.size?.[1] || 560), 560),
-            ]);
+            // 只保证基础宽度，不主动抬高节点；高度交给 ComfyUI 原生布局计算。
+            const width = Math.max(Number(node.size?.[0] || 360), 360);
+            const height = Number(node.size?.[1] || 0);
+            if (node.size && node.size[0] < width) {
+                node.setSize?.([width, height]);
+            }
         });
     },
 });
