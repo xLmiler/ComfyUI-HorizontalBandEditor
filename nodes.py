@@ -1,9 +1,12 @@
+import json
 import os
 from typing import List, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
+
+import folder_paths
 
 MAX_RESOLUTION = 16384
 REGION_LABELS = tuple("ABCDEFGHIJKL")
@@ -11,7 +14,7 @@ REGION_LABELS = tuple("ABCDEFGHIJKL")
 
 def _kw(kwargs, names, default=None):
     for name in names:
-        if name in kwargs:
+        if name and name in kwargs:
             return kwargs[name]
     return default
 
@@ -67,10 +70,10 @@ def _font_candidates(user_value: str) -> List[str]:
     ])
 
     out, seen = [], set()
-    for p in candidates:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
     return out
 
 
@@ -232,6 +235,42 @@ def _collect_regions(kwargs, height):
     return merged
 
 
+def _resolve_input_image_path(source_image_filename: str):
+    if not source_image_filename:
+        return None
+    try:
+        if folder_paths.exists_annotated_filepath(source_image_filename):
+            return folder_paths.get_annotated_filepath(source_image_filename)
+    except Exception:
+        pass
+    candidate = os.path.join(folder_paths.get_input_directory(), source_image_filename)
+    return candidate if os.path.exists(candidate) else None
+
+
+def _extract_source_workflow_metadata(source_image_filename: str):
+    path = _resolve_input_image_path(source_image_filename)
+    if not path:
+        return {}
+    try:
+        with Image.open(path) as img:
+            info = dict(getattr(img, "info", {}) or {})
+    except Exception:
+        return {}
+
+    metadata = {}
+    for key, value in info.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            metadata[str(key)] = str(value) if not isinstance(value, str) else value
+        elif isinstance(value, (dict, list, tuple)):
+            try:
+                metadata[str(key)] = json.dumps(value, ensure_ascii=False)
+            except Exception:
+                pass
+    return metadata
+
+
 class HorizontalBandEditor:
     @classmethod
     def INPUT_TYPES(cls):
@@ -274,6 +313,16 @@ class HorizontalBandEditor:
             "行距": ("INT", {"default": 8, "min": 0, "max": 1024, "step": 1}),
             "水平对齐": (["居中", "左对齐", "右对齐"], {"default": "居中"}),
             "垂直对齐": (["居中", "顶部", "底部"], {"default": "居中"}),
+            "继承源图工作流元数据": ("BOOLEAN", {
+                "default": False,
+                "label_on": "保存节点可继承源图工作流",
+                "label_off": "不继承源图工作流",
+                "tooltip": "仅供配套的“保存编辑图像（继承源图工作流）”节点使用。",
+            }),
+            "源图文件名缓存": ("STRING", {
+                "default": "", "multiline": False,
+                "tooltip": "由前端自动填充，不需要手动编辑。",
+            }),
         })
 
         return {
@@ -281,8 +330,8 @@ class HorizontalBandEditor:
             "optional": {"输入透明遮罩": ("MASK",)},
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT")
-    RETURN_NAMES = ("RGB图像", "透明遮罩", "RGBA图像", "宽度", "高度")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("RGB图像", "透明遮罩", "RGBA图像", "宽度", "高度", "源图文件名", "继承源图工作流")
     FUNCTION = "process"
     CATEGORY = "图像/编辑"
     DESCRIPTION = "使用 ComfyUI 原生参数控件配置多个横向截面；预览固定在节点参数下方。"
@@ -314,6 +363,8 @@ class HorizontalBandEditor:
         line_spacing = int(_kw(kwargs, ("行距", "line_spacing"), 8))
         horizontal_align = _kw(kwargs, ("水平对齐", "horizontal_align"), "居中")
         vertical_align = _kw(kwargs, ("垂直对齐", "vertical_align"), "居中")
+        source_image_filename = str(_kw(kwargs, ("源图文件名缓存", "source_image_filename_cache"), "") or "")
+        inherit_source_workflow = bool(_kw(kwargs, ("继承源图工作流元数据", "inherit_source_workflow_metadata"), False))
 
         pieces = []
         cursor = 0
@@ -354,8 +405,73 @@ class HorizontalBandEditor:
             y += piece.height
 
         rgb, mask, rgba = _pil_to_tensors(out)
-        return rgb, mask, rgba, out.width, out.height
+        return rgb, mask, rgba, out.width, out.height, source_image_filename, inherit_source_workflow
 
 
-NODE_CLASS_MAPPINGS = {"HorizontalBandEditor": HorizontalBandEditor}
-NODE_DISPLAY_NAME_MAPPINGS = {"HorizontalBandEditor": "横向截断 / 文字面板编辑器"}
+class SaveEditedImageWithSourceWorkflow:
+    OUTPUT_NODE = True
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "图像": ("IMAGE",),
+                "源图文件名": ("STRING", {"forceInput": True}),
+                "继承源图工作流": ("BOOLEAN", {"default": True}),
+                "文件名前缀": ("STRING", {"default": "ComfyUI_edited"}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_images"
+    CATEGORY = "图像/保存"
+    DESCRIPTION = "将编辑后的图像保存为 PNG；可选继承源输入图像里的工作流/提示词元数据。"
+
+    def save_images(self, 图像, 源图文件名, 继承源图工作流=True, 文件名前缀="ComfyUI_edited"):
+        images = 图像
+        filename_prefix = 文件名前缀 + self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0]
+        )
+
+        inherited_metadata = _extract_source_workflow_metadata(源图文件名) if 继承源图工作流 else {}
+        results = []
+        for batch_number, image in enumerate(images):
+            i = 255.0 * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+
+            pnginfo = None
+            if inherited_metadata:
+                pnginfo = PngImagePlugin.PngInfo()
+                for key, value in inherited_metadata.items():
+                    try:
+                        pnginfo.add_text(str(key), str(value))
+                    except Exception:
+                        pass
+
+            file = f"{filename}_{counter:05}_.png"
+            img.save(os.path.join(full_output_folder, file), pnginfo=pnginfo, compress_level=self.compress_level)
+            results.append({
+                "filename": file,
+                "subfolder": subfolder,
+                "type": self.type,
+            })
+            counter += 1
+
+        return {"ui": {"images": results}}
+
+
+NODE_CLASS_MAPPINGS = {
+    "HorizontalBandEditor": HorizontalBandEditor,
+    "SaveEditedImageWithSourceWorkflow": SaveEditedImageWithSourceWorkflow,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "HorizontalBandEditor": "横向截断 / 文字面板编辑器",
+    "SaveEditedImageWithSourceWorkflow": "保存编辑图像（继承源图工作流）",
+}

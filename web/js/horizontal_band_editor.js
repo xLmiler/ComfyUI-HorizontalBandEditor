@@ -3,7 +3,9 @@ import { api } from "../../scripts/api.js";
 
 const NODE_NAME = "HorizontalBandEditor";
 const REGION_LABELS = [..."ABCDEFGHIJKL"];
-const PREVIEW_HEIGHT = 320;
+const PREVIEW_MIN_HEIGHT = 320;
+const PREVIEW_MAX_HEIGHT = 960;
+const PREVIEW_DEFAULT_WIDTH = 360;
 
 function getWidget(node, ...names) {
     return node.widgets?.find((w) => names.includes(w.name));
@@ -31,9 +33,7 @@ function chainWidgetCallback(widget, callback) {
 
 function setWidgetHidden(widget, hidden) {
     if (!widget) return;
-    try {
-        widget.hidden = Boolean(hidden);
-    } catch (_) {}
+    try { widget.hidden = Boolean(hidden); } catch (_) {}
     try {
         widget.options ??= {};
         widget.options.hidden = Boolean(hidden);
@@ -42,6 +42,18 @@ function setWidgetHidden(widget, hidden) {
 
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
+}
+
+function isNodes20Enabled() {
+    try {
+        const v = app.extensionManager?.setting?.get?.("Comfy.VueNodes.Enabled");
+        if (typeof v === "boolean") return v;
+    } catch (_) {}
+    try {
+        const v = app.ui?.settings?.getSettingValue?.("Comfy.VueNodes.Enabled");
+        if (typeof v === "boolean") return v;
+    } catch (_) {}
+    return false;
 }
 
 function getConnectedLoadImage(node) {
@@ -72,16 +84,17 @@ function makeViewUrl(filename) {
     return api.apiURL(`/view?${params.toString()}`);
 }
 
-
 function installNativeVisibility(node) {
     const countW = getWidget(node, "截面数量", "region_count");
     const editW = getWidget(node, "编辑截面", "active_region");
     const enableTextW = getWidget(node, "启用文字面板", "text_panel_enabled");
     const bgModeW = getWidget(node, "面板背景", "panel_background");
+    const bgColorW = getWidget(node, "背景颜色", "background_color");
+    const sourceFileCacheW = getWidget(node, "源图文件名缓存", "source_image_filename_cache");
 
     const textWidgets = [
         bgModeW,
-        getWidget(node, "背景颜色", "background_color"),
+        bgColorW,
         getWidget(node, "文字内容", "text"),
         getWidget(node, "文字颜色", "text_color"),
         getWidget(node, "字体名称或路径", "font_name_or_path"),
@@ -91,7 +104,6 @@ function installNativeVisibility(node) {
         getWidget(node, "水平对齐", "horizontal_align"),
         getWidget(node, "垂直对齐", "vertical_align"),
     ].filter(Boolean);
-    const bgColorW = getWidget(node, "背景颜色", "background_color");
 
     const regionWidgets = new Map();
     for (const label of REGION_LABELS) {
@@ -127,6 +139,11 @@ function installNativeVisibility(node) {
             setWidgetHidden(bgColorW, true);
         }
 
+        // 技术缓存字段始终隐藏，由前端自动维护。
+        setWidgetHidden(sourceFileCacheW, true);
+
+        node._hbeRecomputeBaseHeight?.();
+        node._hbeSyncPreviewHeight?.();
         node.graph?.setDirtyCanvas?.(true, true);
         requestAnimationFrame(() => node._hbeDrawPreview?.());
     }
@@ -161,6 +178,7 @@ function installNativeVisibility(node) {
     node._hbeRegionWidgets = regionWidgets;
     node._hbeCountWidget = countW;
     node._hbeEditWidget = editW;
+    node._hbeSourceFileCacheWidget = sourceFileCacheW;
     refresh();
 }
 
@@ -169,7 +187,6 @@ function addPreviewWidget(node) {
 
     const root = document.createElement("div");
     root.style.width = "100%";
-    root.style.height = "100%";
     root.style.boxSizing = "border-box";
     root.style.padding = "6px";
     root.style.display = "flex";
@@ -211,13 +228,15 @@ function addPreviewWidget(node) {
     canvas.style.touchAction = "none";
 
     const hint = document.createElement("div");
-    hint.textContent = "拖拽空白位置重设当前截面；拖动上下边缘调整高度；拖动截面内部可整体移动；点击其他截面可切换。";
+    hint.textContent = "拖拽空白位置重设当前截面；拖动边缘调高低；拖动内部可整体移动；点击其他截面可切换。";
+    hint.title = hint.textContent;
     hint.style.fontSize = "10px";
     hint.style.opacity = "0.64";
-    hint.style.lineHeight = "1.25";
+    hint.style.lineHeight = "1.2";
     hint.style.flex = "0 0 auto";
-    hint.style.whiteSpace = "normal";
-    hint.style.overflowWrap = "anywhere";
+    hint.style.whiteSpace = "nowrap";
+    hint.style.overflow = "hidden";
+    hint.style.textOverflow = "ellipsis";
 
     root.append(header, canvas, hint);
 
@@ -231,7 +250,16 @@ function addPreviewWidget(node) {
         anchorY: 0,
         originalTop: 0,
         originalBottom: 1,
+        nodes20: isNodes20Enabled(),
+        previewHeight: PREVIEW_MIN_HEIGHT,
+        baseHeight: 0,
     };
+
+    function applyRootHeight() {
+        root.style.height = `${state.previewHeight}px`;
+        root.style.maxHeight = `${state.previewHeight}px`;
+        root.style.minHeight = `${state.previewHeight}px`;
+    }
 
     function getCount() {
         return clamp(Number(node._hbeCountWidget?.value ?? 1), 1, REGION_LABELS.length);
@@ -274,8 +302,8 @@ function addPreviewWidget(node) {
 
     function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
-        const cssW = Math.max(1, Math.floor(rect.width));
-        const cssH = Math.max(1, Math.floor(rect.height));
+        const cssW = Math.max(160, Math.floor(rect.width || 1));
+        const cssH = Math.max(120, Math.floor(rect.height || 1));
         const dpr = Math.max(1, window.devicePixelRatio || 1);
         const pixelW = Math.max(1, Math.floor(cssW * dpr));
         const pixelH = Math.max(1, Math.floor(cssH * dpr));
@@ -369,15 +397,9 @@ function addPreviewWidget(node) {
         for (let i = count - 1; i >= 0; i--) {
             const r = getRegion(i);
             if (!r.valid) continue;
-            if (Math.abs(y - r.top) <= tol) {
-                hit = i; hitMode = "top"; break;
-            }
-            if (Math.abs(y - r.bottom) <= tol) {
-                hit = i; hitMode = "bottom"; break;
-            }
-            if (y > r.top && y < r.bottom) {
-                hit = i; hitMode = "move"; break;
-            }
+            if (Math.abs(y - r.top) <= tol) { hit = i; hitMode = "top"; break; }
+            if (Math.abs(y - r.bottom) <= tol) { hit = i; hitMode = "bottom"; break; }
+            if (y > r.top && y < r.bottom) { hit = i; hitMode = "move"; break; }
         }
 
         if (hit >= 0) {
@@ -433,17 +455,51 @@ function addPreviewWidget(node) {
     canvas.addEventListener("pointerup", endDrag);
     canvas.addEventListener("pointercancel", endDrag);
 
+    function recomputeBaseHeight() {
+        try {
+            const computed = node.computeSize?.();
+            const total = Array.isArray(computed) ? Number(computed[1] || 0) : 0;
+            state.baseHeight = Math.max(0, total - state.previewHeight);
+        } catch (_) {
+            state.baseHeight = Math.max(0, state.baseHeight || 0);
+        }
+    }
+
+    function syncPreviewHeight() {
+        state.nodes20 = isNodes20Enabled();
+        let target = PREVIEW_MIN_HEIGHT;
+
+        if (!state.nodes20) {
+            const nodeHeight = Number(node.size?.[1] || 0);
+            if (nodeHeight > 0 && state.baseHeight > 0) {
+                target = clamp(nodeHeight - state.baseHeight, PREVIEW_MIN_HEIGHT, PREVIEW_MAX_HEIGHT);
+            }
+        }
+
+        const changed = target !== state.previewHeight;
+        state.previewHeight = target;
+        applyRootHeight();
+        if (changed) {
+            node.graph?.setDirtyCanvas?.(true, true);
+            requestAnimationFrame(draw);
+        }
+    }
+
     function ensureSource(force = false) {
         const connected = getConnectedLoadImage(node);
+        const cacheW = node._hbeSourceFileCacheWidget;
+
         if (!connected?.filename) {
             if (state.filename !== null) {
                 state.filename = null;
                 state.img = null;
                 status.textContent = "未检测到直接连接的加载图像";
+                if (cacheW) setWidgetValue(cacheW, "", node);
                 draw();
             }
             return;
         }
+        if (cacheW && cacheW.value !== connected.filename) setWidgetValue(cacheW, connected.filename, node);
         if (!force && connected.filename === state.filename && state.img) return;
 
         state.filename = connected.filename;
@@ -464,23 +520,24 @@ function addPreviewWidget(node) {
         img.src = `${makeViewUrl(connected.filename)}&rand=${Date.now()}`;
     }
 
-    const previewWidget = node.addDOMWidget(
-        "编辑预览",
-        "horizontal_band_preview",
-        root,
-        {
-            serialize: false,
-            hideOnZoom: false,
-            margin: 6,
-            // 预览高度必须独立于 node.size，否则 DOM widget 的高度会反过来
-            // 参与节点最小高度计算，形成“节点变高 -> 预览变高 -> 节点再变高”的递归增长。
-            getHeight: () => PREVIEW_HEIGHT,
-            getMinHeight: () => PREVIEW_HEIGHT,
-            getMaxHeight: () => PREVIEW_HEIGHT,
-            afterResize: () => requestAnimationFrame(draw),
-            onDraw: () => ensureSource(false),
-        }
-    );
+    node._hbeRecomputeBaseHeight = recomputeBaseHeight;
+    node._hbeSyncPreviewHeight = syncPreviewHeight;
+
+    applyRootHeight();
+
+    const previewWidget = node.addDOMWidget("编辑预览", "horizontal_band_preview", root, {
+        serialize: false,
+        hideOnZoom: false,
+        margin: 6,
+        getHeight: () => state.previewHeight,
+        getMinHeight: () => state.previewHeight,
+        getMaxHeight: () => state.previewHeight,
+        afterResize: () => {
+            syncPreviewHeight();
+            requestAnimationFrame(draw);
+        },
+        onDraw: () => ensureSource(false),
+    });
     previewWidget.serialize = false;
     node._hbePreviewWidget = previewWidget;
     node._hbeDrawPreview = draw;
@@ -491,6 +548,8 @@ function addPreviewWidget(node) {
     node._hbePreviewCleanup = () => resizeObserver.disconnect();
 
     requestAnimationFrame(() => {
+        recomputeBaseHeight();
+        syncPreviewHeight();
         ensureSource(true);
         draw();
     });
@@ -520,6 +579,18 @@ app.registerExtension({
             requestAnimationFrame(() => {
                 this._hbeRefreshVisibility?.();
                 this._hbeEnsurePreviewSource?.(true);
+                this._hbeRecomputeBaseHeight?.();
+                this._hbeSyncPreviewHeight?.();
+                this._hbeDrawPreview?.();
+            });
+            return result;
+        };
+
+        const originalResize = node.onResize;
+        node.onResize = function (...args) {
+            const result = originalResize?.apply(this, args);
+            requestAnimationFrame(() => {
+                this._hbeSyncPreviewHeight?.();
                 this._hbeDrawPreview?.();
             });
             return result;
@@ -532,12 +603,15 @@ app.registerExtension({
         };
 
         requestAnimationFrame(() => {
-            // 只保证基础宽度，不主动抬高节点；高度交给 ComfyUI 原生布局计算。
-            const width = Math.max(Number(node.size?.[0] || 360), 360);
+            const width = Math.max(Number(node.size?.[0] || PREVIEW_DEFAULT_WIDTH), PREVIEW_DEFAULT_WIDTH);
             const height = Number(node.size?.[1] || 0);
             if (node.size && node.size[0] < width) {
                 node.setSize?.([width, height]);
             }
+            node._hbeRecomputeBaseHeight?.();
+            node._hbeSyncPreviewHeight?.();
+            node._hbeEnsurePreviewSource?.(true);
+            node._hbeDrawPreview?.();
         });
     },
 });
