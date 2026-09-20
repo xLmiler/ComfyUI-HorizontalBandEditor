@@ -3,10 +3,8 @@ import { api } from "../../scripts/api.js";
 
 const NODE_NAME = "HorizontalBandEditor";
 const REGION_LABELS = [..."ABCDEFGHIJKL"];
-const PREVIEW_MIN_HEIGHT = 320;
-const PREVIEW_MAX_HEIGHT = 960;
+const PREVIEW_MIN_HEIGHT = 220;
 const PREVIEW_DEFAULT_WIDTH = 360;
-const CLASSIC_HEIGHT_ZOOM_POWER = 1.0;
 
 function getWidget(node, ...names) {
     return node.widgets?.find((w) => names.includes(w.name));
@@ -45,17 +43,6 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
-function isNodes20Enabled() {
-    try {
-        const v = app.extensionManager?.setting?.get?.("Comfy.VueNodes.Enabled");
-        if (typeof v === "boolean") return v;
-    } catch (_) {}
-    try {
-        const v = app.ui?.settings?.getSettingValue?.("Comfy.VueNodes.Enabled");
-        if (typeof v === "boolean") return v;
-    } catch (_) {}
-    return false;
-}
 
 function getConnectedLoadImage(node) {
     if (!node?.inputs?.length || !app.graph) return null;
@@ -143,8 +130,6 @@ function installNativeVisibility(node) {
         // 技术缓存字段始终隐藏，由前端自动维护。
         setWidgetHidden(sourceFileCacheW, true);
 
-        node._hbeRecomputeBaseHeight?.();
-        node._hbeSyncPreviewHeight?.();
         node.graph?.setDirtyCanvas?.(true, true);
         requestAnimationFrame(() => node._hbeDrawPreview?.());
     }
@@ -188,6 +173,8 @@ function addPreviewWidget(node) {
 
     const root = document.createElement("div");
     root.style.width = "100%";
+    root.style.height = "100%";
+    root.style.minHeight = `${PREVIEW_MIN_HEIGHT}px`;
     root.style.boxSizing = "border-box";
     root.style.padding = "6px";
     root.style.display = "flex";
@@ -251,16 +238,8 @@ function addPreviewWidget(node) {
         anchorY: 0,
         originalTop: 0,
         originalBottom: 1,
-        nodes20: isNodes20Enabled(),
-        previewHeight: PREVIEW_MIN_HEIGHT,
-        baseHeight: 0,
     };
 
-    function applyRootHeight() {
-        root.style.height = `${state.previewHeight}px`;
-        root.style.maxHeight = `${state.previewHeight}px`;
-        root.style.minHeight = `${state.previewHeight}px`;
-    }
 
     function getCount() {
         return clamp(Number(node._hbeCountWidget?.value ?? 1), 1, REGION_LABELS.length);
@@ -331,23 +310,10 @@ function addPreviewWidget(node) {
             return;
         }
 
-        // Nodes 2.0 使用标准 contain，确保布局稳定。
-        // 经典 UI 下，节点纵向拉高代表“放大编辑视图”：
-        // 在基础 contain 比例上乘以预览高度相对最小高度的缩放因子。
-        // 这样纵向拉伸时图片也会等比例放大；如果宽度超过视口，则由 canvas 自然裁切，
-        // 不做非等比拉伸，因此截面坐标映射仍然准确。
-        const containScale = Math.min(cssW / state.img.naturalWidth, cssH / state.img.naturalHeight);
-        let scale = containScale;
-        if (!state.nodes20) {
-            // 以“最小预览高度”时的 contain 比例作为基准，随后严格按用户拉高的比例放大。
-            // 不能再使用当前 cssH 的 containScale 乘高度倍率，否则竖图会发生二次放大。
-            const baseContainScale = Math.min(
-                cssW / state.img.naturalWidth,
-                PREVIEW_MIN_HEIGHT / state.img.naturalHeight
-            );
-            const heightZoom = Math.max(1, Math.pow(state.previewHeight / PREVIEW_MIN_HEIGHT, CLASSIC_HEIGHT_ZOOM_POWER));
-            scale = baseContainScale * heightZoom;
-        }
+        // 完全使用 ComfyUI 原生预览的思路：
+        // widget 获得多少实际空间，图片就在这个空间内等比例 contain。
+        // 因此节点横向/纵向缩放时，经典 UI 与 Nodes 2.0 都会同步改变图片尺寸。
+        const scale = Math.min(cssW / state.img.naturalWidth, cssH / state.img.naturalHeight);
 
         const dw = state.img.naturalWidth * scale;
         const dh = state.img.naturalHeight * scale;
@@ -478,35 +444,6 @@ function addPreviewWidget(node) {
     canvas.addEventListener("pointerup", endDrag);
     canvas.addEventListener("pointercancel", endDrag);
 
-    function recomputeBaseHeight() {
-        try {
-            const computed = node.computeSize?.();
-            const total = Array.isArray(computed) ? Number(computed[1] || 0) : 0;
-            state.baseHeight = Math.max(0, total - state.previewHeight);
-        } catch (_) {
-            state.baseHeight = Math.max(0, state.baseHeight || 0);
-        }
-    }
-
-    function syncPreviewHeight() {
-        state.nodes20 = isNodes20Enabled();
-        let target = PREVIEW_MIN_HEIGHT;
-
-        if (!state.nodes20) {
-            const nodeHeight = Number(node.size?.[1] || 0);
-            if (nodeHeight > 0 && state.baseHeight > 0) {
-                target = clamp(nodeHeight - state.baseHeight, PREVIEW_MIN_HEIGHT, PREVIEW_MAX_HEIGHT);
-            }
-        }
-
-        const changed = target !== state.previewHeight;
-        state.previewHeight = target;
-        applyRootHeight();
-        if (changed) {
-            node.graph?.setDirtyCanvas?.(true, true);
-            requestAnimationFrame(draw);
-        }
-    }
 
     function ensureSource(force = false) {
         const connected = getConnectedLoadImage(node);
@@ -543,22 +480,15 @@ function addPreviewWidget(node) {
         img.src = `${makeViewUrl(connected.filename)}&rand=${Date.now()}`;
     }
 
-    node._hbeRecomputeBaseHeight = recomputeBaseHeight;
-    node._hbeSyncPreviewHeight = syncPreviewHeight;
-
-    applyRootHeight();
-
     const previewWidget = node.addDOMWidget("编辑预览", "horizontal_band_preview", root, {
         serialize: false,
         hideOnZoom: false,
         margin: 6,
-        getHeight: () => state.previewHeight,
-        getMinHeight: () => state.previewHeight,
-        getMaxHeight: () => state.previewHeight,
-        afterResize: () => {
-            syncPreviewHeight();
-            requestAnimationFrame(draw);
-        },
+        // 与 ComfyUI 原生 ImagePreviewWidget 相同：只声明最小高度。
+        // 不声明固定高度/最大高度，也不从 node.size 反推自身高度。
+        // 经典 UI 与 Nodes 2.0 都会把节点剩余高度分配给这个 widget。
+        getMinHeight: () => PREVIEW_MIN_HEIGHT,
+        afterResize: () => requestAnimationFrame(draw),
         onDraw: () => ensureSource(false),
     });
     previewWidget.serialize = false;
@@ -571,8 +501,6 @@ function addPreviewWidget(node) {
     node._hbePreviewCleanup = () => resizeObserver.disconnect();
 
     requestAnimationFrame(() => {
-        recomputeBaseHeight();
-        syncPreviewHeight();
         ensureSource(true);
         draw();
     });
@@ -602,8 +530,6 @@ app.registerExtension({
             requestAnimationFrame(() => {
                 this._hbeRefreshVisibility?.();
                 this._hbeEnsurePreviewSource?.(true);
-                this._hbeRecomputeBaseHeight?.();
-                this._hbeSyncPreviewHeight?.();
                 this._hbeDrawPreview?.();
             });
             return result;
@@ -612,10 +538,7 @@ app.registerExtension({
         const originalResize = node.onResize;
         node.onResize = function (...args) {
             const result = originalResize?.apply(this, args);
-            requestAnimationFrame(() => {
-                this._hbeSyncPreviewHeight?.();
-                this._hbeDrawPreview?.();
-            });
+            requestAnimationFrame(() => this._hbeDrawPreview?.());
             return result;
         };
 
@@ -631,8 +554,6 @@ app.registerExtension({
             if (node.size && node.size[0] < width) {
                 node.setSize?.([width, height]);
             }
-            node._hbeRecomputeBaseHeight?.();
-            node._hbeSyncPreviewHeight?.();
             node._hbeEnsurePreviewSource?.(true);
             node._hbeDrawPreview?.();
         });
