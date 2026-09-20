@@ -1,4 +1,3 @@
-import json
 import os
 from typing import List, Tuple
 
@@ -7,30 +6,13 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 MAX_RESOLUTION = 16384
-
-# 新中文键 + 旧版本英文键兼容
-K_IMAGE_IN = ("输入图像", "input_image")
-K_TEXT_PANEL_ENABLED = ("启用文字面板", "text_panel_enabled")
-K_SELECTION_TOP = ("选区上边界(px)", "selection_top_px")
-K_SELECTION_BOTTOM = ("选区下边界(px)", "selection_bottom_px")
-K_REGIONS = ("截面列表", "regions_json")
-K_PANEL_BACKGROUND = ("面板背景", "panel_background")
-K_BACKGROUND_COLOR = ("背景颜色", "background_color")
-K_TEXT = ("文字内容", "text")
-K_TEXT_COLOR = ("文字颜色", "text_color")
-K_FONT_NAME = ("字体名称或路径", "font_name_or_path")
-K_FONT_SIZE = ("字号", "font_size")
-K_PADDING = ("内边距", "padding")
-K_LINE_SPACING = ("行距", "line_spacing")
-K_HORIZONTAL_ALIGN = ("水平对齐", "horizontal_align")
-K_VERTICAL_ALIGN = ("垂直对齐", "vertical_align")
-K_INPUT_ALPHA_MASK = ("输入透明遮罩", "input_alpha_mask")
+REGION_LABELS = tuple("ABCDEFGHIJKL")
 
 
-def _kw(kwargs, keys, default=None):
-    for key in keys:
-        if key in kwargs:
-            return kwargs[key]
+def _kw(kwargs, names, default=None):
+    for name in names:
+        if name in kwargs:
+            return kwargs[name]
     return default
 
 
@@ -222,76 +204,80 @@ def _tensor_to_pil(input_image: torch.Tensor, input_alpha_mask=None) -> Image.Im
     return Image.fromarray(np.dstack([rgb, alpha]), mode="RGBA")
 
 
-def _normalize_regions(raw, height, fallback_top, fallback_bottom):
-    parsed = []
-    if isinstance(raw, str) and raw.strip():
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        a, b = item.get("top"), item.get("bottom")
-                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                        a, b = item[0], item[1]
-                    else:
-                        continue
-                    try:
-                        a, b = int(a), int(b)
-                    except Exception:
-                        continue
-                    a = max(0, min(height - 1, a))
-                    b = max(1, min(height, b))
-                    if b > a:
-                        parsed.append((a, b))
-        except Exception:
-            parsed = []
+def _collect_regions(kwargs, height):
+    count = int(_kw(kwargs, ("截面数量", "region_count"), 1))
+    count = max(1, min(len(REGION_LABELS), count))
+    regions = []
 
-    if not parsed:
-        a = max(0, min(height - 1, int(fallback_top)))
-        b = max(1, min(height, int(fallback_bottom)))
-        if b <= a:
-            b = min(height, a + 1)
-        parsed = [(a, b)]
+    for i, label in enumerate(REGION_LABELS[:count]):
+        legacy_top = "selection_top_px" if i == 0 else f"region_{label.lower()}_top"
+        legacy_bottom = "selection_bottom_px" if i == 0 else f"region_{label.lower()}_bottom"
+        top = int(_kw(kwargs, (f"截面{label}上边界(px)", "选区上边界(px)" if i == 0 else "", legacy_top), 0))
+        bottom = int(_kw(kwargs, (f"截面{label}下边界(px)", "选区下边界(px)" if i == 0 else "", legacy_bottom), 0))
+        top = max(0, min(height - 1, top))
+        bottom = max(0, min(height, bottom))
+        if bottom > top:
+            regions.append([top, bottom])
 
-    parsed.sort(key=lambda x: (x[0], x[1]))
+    if not regions:
+        regions = [[0, min(1, height)]]
+
+    regions.sort(key=lambda v: (v[0], v[1]))
     merged = []
-    for a, b in parsed:
-        if not merged or a > merged[-1][1]:
-            merged.append([a, b])
+    for top, bottom in regions:
+        if not merged or top > merged[-1][1]:
+            merged.append([top, bottom])
         else:
-            merged[-1][1] = max(merged[-1][1], b)
-    return [(a, b) for a, b in merged]
+            merged[-1][1] = max(merged[-1][1], bottom)
+    return merged
 
 
 class HorizontalBandEditor:
     @classmethod
     def INPUT_TYPES(cls):
+        required = {
+            "输入图像": ("IMAGE", {"tooltip": "连接 ComfyUI 的“加载图像”或其他 IMAGE 输出。"}),
+            "截面数量": ("INT", {
+                "default": 1, "min": 1, "max": len(REGION_LABELS), "step": 1,
+                "tooltip": "最多可同时编辑 12 个横向截面。增加数量后会自动切换到新截面。",
+            }),
+            "编辑截面": (list(REGION_LABELS), {
+                "default": "A",
+                "tooltip": "选择当前在预览中编辑的截面。也可以直接点击预览中的已有截面切换。",
+            }),
+        }
+
+        for i, label in enumerate(REGION_LABELS):
+            required[f"截面{label}上边界(px)"] = (
+                "INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}
+            )
+            required[f"截面{label}下边界(px)"] = (
+                "INT", {"default": 1 if i == 0 else 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}
+            )
+
+        required.update({
+            "启用文字面板": ("BOOLEAN", {
+                "default": False,
+                "label_on": "开启：以文字面板替换截面",
+                "label_off": "关闭：删除截面并拼接",
+            }),
+            "面板背景": (["纯色", "透明"], {"default": "纯色"}),
+            "背景颜色": ("STRING", {"default": "#FFFFFF", "multiline": False}),
+            "文字内容": ("STRING", {"default": "在这里输入文字", "multiline": True}),
+            "文字颜色": ("STRING", {"default": "#000000", "multiline": False}),
+            "字体名称或路径": ("STRING", {
+                "default": "SimHei", "multiline": False,
+                "tooltip": "默认使用简中黑体。也可以填写字体文件完整路径。",
+            }),
+            "字号": ("INT", {"default": 48, "min": 1, "max": 1024, "step": 1}),
+            "内边距": ("INT", {"default": 24, "min": 0, "max": 2048, "step": 1}),
+            "行距": ("INT", {"default": 8, "min": 0, "max": 1024, "step": 1}),
+            "水平对齐": (["居中", "左对齐", "右对齐"], {"default": "居中"}),
+            "垂直对齐": (["居中", "顶部", "底部"], {"default": "居中"}),
+        })
+
         return {
-            "required": {
-                "输入图像": ("IMAGE", {"tooltip": "连接 ComfyUI 的“加载图像”或其他 IMAGE 输出。"}),
-                "启用文字面板": ("BOOLEAN", {
-                    "default": False,
-                    "label_on": "开启：替换为文字面板",
-                    "label_off": "关闭：删除所有截面并拼接",
-                }),
-                "选区上边界(px)": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
-                "选区下边界(px)": ("INT", {"default": 1, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
-                "截面列表": ("STRING", {
-                    "default": "[]",
-                    "multiline": False,
-                    "tooltip": "增强 UI 自动维护。格式示例：[[100,200],[500,640]]。为空时使用当前选区。",
-                }),
-                "面板背景": (["纯色", "透明"], {"default": "纯色"}),
-                "背景颜色": ("STRING", {"default": "#FFFFFF", "multiline": False}),
-                "文字内容": ("STRING", {"default": "在这里输入文字", "multiline": True}),
-                "文字颜色": ("STRING", {"default": "#000000", "multiline": False}),
-                "字体名称或路径": ("STRING", {"default": "SimHei", "multiline": False}),
-                "字号": ("INT", {"default": 48, "min": 1, "max": 1024, "step": 1}),
-                "内边距": ("INT", {"default": 24, "min": 0, "max": 2048, "step": 1}),
-                "行距": ("INT", {"default": 8, "min": 0, "max": 1024, "step": 1}),
-                "水平对齐": (["居中", "左对齐", "右对齐"], {"default": "居中"}),
-                "垂直对齐": (["居中", "顶部", "底部"], {"default": "居中"}),
-            },
+            "required": required,
             "optional": {"输入透明遮罩": ("MASK",)},
         }
 
@@ -299,7 +285,7 @@ class HorizontalBandEditor:
     RETURN_NAMES = ("RGB图像", "透明遮罩", "RGBA图像", "宽度", "高度")
     FUNCTION = "process"
     CATEGORY = "图像/编辑"
-    DESCRIPTION = "支持选择多个横向截面；可批量删除并拼接，或用同一文字面板替换每个截面。"
+    DESCRIPTION = "使用 ComfyUI 原生参数控件配置多个横向截面；预览固定在节点参数下方。"
 
     @classmethod
     def VALIDATE_INPUTS(cls, **kwargs):
@@ -310,36 +296,35 @@ class HorizontalBandEditor:
         return float("nan")
 
     def process(self, **kwargs):
-        input_image = _kw(kwargs, K_IMAGE_IN)
-        input_alpha_mask = _kw(kwargs, K_INPUT_ALPHA_MASK, None)
+        input_image = _kw(kwargs, ("输入图像", "input_image"))
+        input_alpha_mask = _kw(kwargs, ("输入透明遮罩", "input_alpha_mask"), None)
         src = _tensor_to_pil(input_image, input_alpha_mask)
         width, height = src.size
 
-        text_panel_enabled = bool(_kw(kwargs, K_TEXT_PANEL_ENABLED, False))
-        selection_top_px = int(_kw(kwargs, K_SELECTION_TOP, 0))
-        selection_bottom_px = int(_kw(kwargs, K_SELECTION_BOTTOM, 1))
-        regions = _normalize_regions(_kw(kwargs, K_REGIONS, "[]"), height, selection_top_px, selection_bottom_px)
+        regions = _collect_regions(kwargs, height)
+        text_panel_enabled = bool(_kw(kwargs, ("启用文字面板", "text_panel_enabled"), False))
 
-        panel_background = _kw(kwargs, K_PANEL_BACKGROUND, "纯色")
-        background_color = _kw(kwargs, K_BACKGROUND_COLOR, "#FFFFFF")
-        text = _kw(kwargs, K_TEXT, "在这里输入文字")
-        text_color = _kw(kwargs, K_TEXT_COLOR, "#000000")
-        font_name_or_path = _kw(kwargs, K_FONT_NAME, "SimHei")
-        font_size = int(_kw(kwargs, K_FONT_SIZE, 48))
-        padding = int(_kw(kwargs, K_PADDING, 24))
-        line_spacing = int(_kw(kwargs, K_LINE_SPACING, 8))
-        horizontal_align = _kw(kwargs, K_HORIZONTAL_ALIGN, "居中")
-        vertical_align = _kw(kwargs, K_VERTICAL_ALIGN, "居中")
+        panel_background = _kw(kwargs, ("面板背景", "panel_background"), "纯色")
+        background_color = _kw(kwargs, ("背景颜色", "background_color"), "#FFFFFF")
+        text = _kw(kwargs, ("文字内容", "text"), "在这里输入文字")
+        text_color = _kw(kwargs, ("文字颜色", "text_color"), "#000000")
+        font_name_or_path = _kw(kwargs, ("字体名称或路径", "font_name_or_path"), "SimHei")
+        font_size = int(_kw(kwargs, ("字号", "font_size"), 48))
+        padding = int(_kw(kwargs, ("内边距", "padding"), 24))
+        line_spacing = int(_kw(kwargs, ("行距", "line_spacing"), 8))
+        horizontal_align = _kw(kwargs, ("水平对齐", "horizontal_align"), "居中")
+        vertical_align = _kw(kwargs, ("垂直对齐", "vertical_align"), "居中")
 
         pieces = []
         cursor = 0
-        for y1, y2 in regions:
-            if y1 > cursor:
-                pieces.append(src.crop((0, cursor, width, y1)))
+        for top, bottom in regions:
+            if top > cursor:
+                pieces.append(src.crop((0, cursor, width, top)))
+
             if text_panel_enabled:
                 pieces.append(_draw_text_panel(
                     width=width,
-                    selected_height=y2 - y1,
+                    selected_height=bottom - top,
                     text=text,
                     font_name_or_path=font_name_or_path,
                     font_size=font_size,
@@ -351,21 +336,20 @@ class HorizontalBandEditor:
                     horizontal_align=horizontal_align,
                     vertical_align=vertical_align,
                 ))
-            cursor = max(cursor, y2)
+            cursor = max(cursor, bottom)
 
         if cursor < height:
             pieces.append(src.crop((0, cursor, width, height)))
 
         if not pieces:
-            raise ValueError("截面覆盖了整张图片，删除后没有剩余内容。请至少保留部分图像。")
+            raise ValueError("不能删除整张图片。请至少保留一部分原图，或开启文字面板。")
 
-        out_height = sum(p.height for p in pieces)
-        if out_height <= 0:
-            raise ValueError("输出高度为 0，请调整截面范围。")
-
+        out_height = sum(piece.height for piece in pieces)
         out = Image.new("RGBA", (width, out_height), (0, 0, 0, 0))
         y = 0
         for piece in pieces:
+            if piece.height <= 0:
+                continue
             out.alpha_composite(piece, (0, y))
             y += piece.height
 
