@@ -32,10 +32,49 @@ function chainWidgetCallback(widget, callback) {
 
 function setWidgetHidden(widget, hidden) {
     if (!widget) return;
-    try { widget.hidden = Boolean(hidden); } catch (_) {}
+    const value = Boolean(hidden);
+
+    // ComfyUI 新前端的布局核心直接检查 visibility.suppression.byExtension。
+    // 优先写这里，经典 Canvas 与 Nodes 2.0 会共用同一套布局可见性。
+    try {
+        if (widget.visibility?.suppression) {
+            widget.visibility.suppression.byExtension = value;
+        }
+    } catch (_) {}
+
+    // 兼容旧前端。
+    try { widget.hidden = value; } catch (_) {}
     try {
         widget.options ??= {};
-        widget.options.hidden = Boolean(hidden);
+        widget.options.hidden = value;
+    } catch (_) {}
+    try {
+        if (widget._state?.options) widget._state.options.hidden = value;
+    } catch (_) {}
+}
+
+function refreshWidgetLayout(node) {
+    // Nodes 2.0 的 widget 列表是浅响应数组。动态修改可见性后，
+    // 轻触数组尾部可确保 Vue 重新映射；顺序不会变化。
+    try {
+        const widgets = node.widgets;
+        if (Array.isArray(widgets) && widgets.length) {
+            const last = widgets.pop();
+            if (last) widgets.push(last);
+        }
+    } catch (_) {}
+    node._widgetSlotsDirty = true;
+    node.graph?.setDirtyCanvas?.(true, true);
+}
+
+function fixMultilineWidgetHeight(widget, height = 88) {
+    if (!widget || widget._hbeFixedMultilineHeight) return;
+    widget._hbeFixedMultilineHeight = true;
+    try {
+        widget.options ??= {};
+        widget.options.getMinHeight = () => height;
+        widget.options.getMaxHeight = () => height;
+        widget.options.getHeight = () => height;
     } catch (_) {}
 }
 
@@ -78,12 +117,18 @@ function installNativeVisibility(node) {
     const enableTextW = getWidget(node, "启用文字面板", "text_panel_enabled");
     const bgModeW = getWidget(node, "面板背景", "panel_background");
     const bgColorW = getWidget(node, "背景颜色", "background_color");
+    const textContentW = getWidget(node, "文字内容", "text");
     const sourceFileCacheW = getWidget(node, "源图文件名缓存", "source_image_filename_cache");
+
+    // multiline STRING 本身也是 growable DOM widget。若不限制高度，开启文字面板后
+    // 它会和编辑预览共同瓜分节点拉伸出来的 freeWidgetSpace。
+    // 固定文字编辑框高度，让底部预览成为唯一的自由增长区域。
+    fixMultilineWidgetHeight(textContentW, 88);
 
     const textWidgets = [
         bgModeW,
         bgColorW,
-        getWidget(node, "文字内容", "text"),
+        textContentW,
         getWidget(node, "文字颜色", "text_color"),
         getWidget(node, "字体名称或路径", "font_name_or_path"),
         getWidget(node, "字号", "font_size"),
@@ -130,8 +175,12 @@ function installNativeVisibility(node) {
         // 技术缓存字段始终隐藏，由前端自动维护。
         setWidgetHidden(sourceFileCacheW, true);
 
-        node.graph?.setDirtyCanvas?.(true, true);
-        requestAnimationFrame(() => node._hbeDrawPreview?.());
+        refreshWidgetLayout(node);
+        requestAnimationFrame(() => {
+            // 重新安排固定 widget 与唯一的 growable 预览。
+            try { node.arrange?.(); } catch (_) {}
+            node._hbeDrawPreview?.();
+        });
     }
 
     chainWidgetCallback(countW, () => {
