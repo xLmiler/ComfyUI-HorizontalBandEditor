@@ -1,0 +1,2 @@
+# ComfyUI 本身已包含 torch / numpy / Pillow。
+# 该插件不引入额外第三方依赖。
