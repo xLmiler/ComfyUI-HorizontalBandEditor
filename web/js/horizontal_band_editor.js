@@ -6,6 +6,7 @@ const REGION_LABELS = [..."ABCDEFGHIJKL"];
 const PREVIEW_MIN_HEIGHT = 320;
 const PREVIEW_MAX_HEIGHT = 960;
 const PREVIEW_DEFAULT_WIDTH = 360;
+const CLASSIC_HEIGHT_ZOOM_POWER = 1.0;
 
 function getWidget(node, ...names) {
     return node.widgets?.find((w) => names.includes(w.name));
@@ -330,13 +331,35 @@ function addPreviewWidget(node) {
             return;
         }
 
-        const scale = Math.min(cssW / state.img.naturalWidth, cssH / state.img.naturalHeight);
+        // Nodes 2.0 使用标准 contain，确保布局稳定。
+        // 经典 UI 下，节点纵向拉高代表“放大编辑视图”：
+        // 在基础 contain 比例上乘以预览高度相对最小高度的缩放因子。
+        // 这样纵向拉伸时图片也会等比例放大；如果宽度超过视口，则由 canvas 自然裁切，
+        // 不做非等比拉伸，因此截面坐标映射仍然准确。
+        const containScale = Math.min(cssW / state.img.naturalWidth, cssH / state.img.naturalHeight);
+        let scale = containScale;
+        if (!state.nodes20) {
+            // 以“最小预览高度”时的 contain 比例作为基准，随后严格按用户拉高的比例放大。
+            // 不能再使用当前 cssH 的 containScale 乘高度倍率，否则竖图会发生二次放大。
+            const baseContainScale = Math.min(
+                cssW / state.img.naturalWidth,
+                PREVIEW_MIN_HEIGHT / state.img.naturalHeight
+            );
+            const heightZoom = Math.max(1, Math.pow(state.previewHeight / PREVIEW_MIN_HEIGHT, CLASSIC_HEIGHT_ZOOM_POWER));
+            scale = baseContainScale * heightZoom;
+        }
+
         const dw = state.img.naturalWidth * scale;
         const dh = state.img.naturalHeight * scale;
         const dx = (cssW - dw) / 2;
         const dy = (cssH - dh) / 2;
         state.displayRect = { x: dx, y: dy, w: dw, h: dh };
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, cssW, cssH);
+        ctx.clip();
         ctx.drawImage(state.img, dx, dy, dw, dh);
+        ctx.restore();
 
         const count = getCount();
         const selected = getSelectedIndex();
