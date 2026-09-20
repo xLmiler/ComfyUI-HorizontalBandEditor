@@ -2,8 +2,19 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const NODE_NAME = "HorizontalBandEditor";
-const NODE_MIN_W = 430;
-const NODE_MIN_H = 900;
+const VUE_NODES_SETTING = "Comfy.VueNodes.Enabled";
+
+function isNodes2Enabled() {
+    try {
+        const v = app.extensionManager?.setting?.get?.(VUE_NODES_SETTING);
+        if (v !== undefined) return v === true || v === "true" || v === 1;
+    } catch (_) {}
+    try {
+        const v = app.ui?.settings?.getSettingValue?.(VUE_NODES_SETTING);
+        return v === true || v === "true" || v === 1;
+    } catch (_) {}
+    return false;
+}
 
 function getWidget(node, ...names) {
     return node.widgets?.find((w) => names.includes(w.name));
@@ -12,11 +23,7 @@ function getWidget(node, ...names) {
 function setWidgetValue(widget, value, node) {
     if (!widget) return;
     widget.value = value;
-    try {
-        widget.callback?.(value, app.canvas, node, [0, 0], {});
-    } catch (_) {
-        // 兼容不同前端 callback 差异
-    }
+    try { widget.callback?.(value, app.canvas, node, [0, 0], {}); } catch (_) {}
     node.setDirtyCanvas?.(true, true);
 }
 
@@ -31,222 +38,241 @@ function hideWidget(widget) {
     widget.options = { ...(widget.options || {}), hidden: true };
 }
 
-function bindWidgetSync(widget, onChange) {
+function bindWidgetSync(widget, callback) {
     if (!widget) return;
     const original = widget.callback;
     widget.callback = function (...args) {
-        const result = original?.apply(this, args);
-        onChange?.();
-        return result;
+        const out = original?.apply(this, args);
+        callback?.();
+        return out;
     };
 }
 
 function makeViewUrl(value) {
-    if (!value) return "";
     const params = new URLSearchParams();
-    params.set("filename", String(value));
+    params.set("filename", String(value || ""));
     params.set("type", "input");
     params.set("subfolder", "");
     return api.apiURL(`/view?${params.toString()}`);
 }
 
-function getConnectedPreviewFilename(node) {
+function getConnectedLoadImage(node) {
     if (!node?.inputs?.length || !app.graph) return null;
     for (const input of node.inputs) {
         if (!input || !["输入图像", "input_image"].includes(input.name) || input.link == null) continue;
         const link = app.graph.links?.[input.link];
-        const originId = link?.origin_id;
-        if (originId == null) continue;
-        const upstream = app.graph.getNodeById?.(originId);
+        const upstream = link?.origin_id != null ? app.graph.getNodeById?.(link.origin_id) : null;
         if (!upstream) continue;
-
         const imageWidget = upstream.widgets?.find((w) => w.name === "image");
         if (imageWidget?.value) {
             return {
                 filename: String(imageWidget.value),
-                nodeTitle: upstream.title || upstream.type || `#${originId}`,
+                title: upstream.title || upstream.type || "加载图像",
             };
         }
     }
     return null;
 }
 
-function createFieldRow(labelText, controlEl) {
-    const row = document.createElement("div");
-    row.style.display = "grid";
-    row.style.gridTemplateColumns = "86px 1fr";
-    row.style.gap = "8px";
-    row.style.alignItems = "center";
-    row.style.marginBottom = "8px";
-
-    const label = document.createElement("div");
-    label.textContent = labelText;
-    label.style.fontSize = "11px";
-    label.style.opacity = "0.9";
-
-    row.append(label, controlEl);
-    return row;
+function parseRegions(raw) {
+    try {
+        const data = JSON.parse(String(raw || "[]"));
+        if (!Array.isArray(data)) return [];
+        return data.map((v) => Array.isArray(v) ? [Number(v[0]), Number(v[1])] : [Number(v?.top), Number(v?.bottom)])
+            .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && b > a);
+    } catch (_) {
+        return [];
+    }
 }
 
-function styleInput(el) {
+function normalizeRegions(regions, height = Infinity) {
+    const valid = regions.map(([a, b]) => [Math.max(0, Math.round(a)), Math.min(height, Math.round(b))])
+        .filter(([a, b]) => b > a)
+        .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const out = [];
+    for (const [a, b] of valid) {
+        if (!out.length || a > out[out.length - 1][1]) out.push([a, b]);
+        else out[out.length - 1][1] = Math.max(out[out.length - 1][1], b);
+    }
+    return out;
+}
+
+function writeRegions(widget, regions, node) {
+    setWidgetValue(widget, JSON.stringify(regions), node);
+}
+
+function styleInput(el, modern) {
     el.style.width = "100%";
     el.style.boxSizing = "border-box";
-    el.style.height = "30px";
-    el.style.borderRadius = "6px";
-    el.style.border = "1px solid rgba(255,255,255,0.18)";
-    el.style.background = "rgba(255,255,255,0.06)";
+    el.style.height = modern ? "32px" : "30px";
+    el.style.borderRadius = modern ? "8px" : "6px";
+    el.style.border = "1px solid rgba(255,255,255,0.16)";
+    el.style.background = modern ? "rgba(255,255,255,0.055)" : "rgba(255,255,255,0.06)";
     el.style.color = "inherit";
     el.style.padding = "0 8px";
     el.style.fontSize = "12px";
     return el;
 }
 
-function styleTextArea(el) {
-    el.style.width = "100%";
-    el.style.minHeight = "120px";
-    el.style.resize = "vertical";
-    el.style.boxSizing = "border-box";
-    el.style.borderRadius = "8px";
-    el.style.border = "1px solid rgba(255,255,255,0.18)";
-    el.style.background = "rgba(255,255,255,0.06)";
-    el.style.color = "inherit";
-    el.style.padding = "8px";
-    el.style.font = "12px sans-serif";
-    el.style.lineHeight = "1.5";
-    return el;
+function fieldRow(labelText, control, modern) {
+    const row = document.createElement("div");
+    row.style.display = "grid";
+    row.style.gridTemplateColumns = modern ? "96px minmax(0,1fr)" : "86px minmax(0,1fr)";
+    row.style.gap = "8px";
+    row.style.alignItems = "center";
+    row.style.marginBottom = "7px";
+    const label = document.createElement("div");
+    label.textContent = labelText;
+    label.style.fontSize = "11px";
+    label.style.opacity = "0.88";
+    label.style.whiteSpace = "normal";
+    label.style.overflowWrap = "anywhere";
+    row.append(label, control);
+    return row;
 }
 
-function createSection(title, open = true) {
-    const details = document.createElement("details");
-    details.open = open;
-    details.style.border = "1px solid rgba(255,255,255,0.10)";
-    details.style.borderRadius = "8px";
-    details.style.padding = "0";
-    details.style.background = "rgba(255,255,255,0.03)";
-    details.style.overflow = "hidden";
-
-    const summary = document.createElement("summary");
-    summary.textContent = title;
-    summary.style.cursor = "pointer";
-    summary.style.listStyle = "none";
-    summary.style.padding = "8px 10px";
-    summary.style.fontSize = "12px";
-    summary.style.fontWeight = "700";
-    summary.style.borderBottom = "1px solid rgba(255,255,255,0.07)";
-    summary.style.userSelect = "none";
-    details.appendChild(summary);
-
-    const body = document.createElement("div");
-    body.style.padding = "8px";
-    body.style.display = "flex";
-    body.style.flexDirection = "column";
-    body.style.gap = "4px";
-    details.appendChild(body);
-
-    return { details, summary, body };
+function section(title, modern, open = true) {
+    const d = document.createElement("details");
+    d.open = open;
+    d.style.border = "1px solid rgba(255,255,255,0.10)";
+    d.style.borderRadius = modern ? "10px" : "8px";
+    d.style.background = modern ? "rgba(255,255,255,0.025)" : "rgba(255,255,255,0.035)";
+    d.style.overflow = "hidden";
+    const s = document.createElement("summary");
+    s.textContent = title;
+    s.style.padding = modern ? "9px 11px" : "8px 10px";
+    s.style.cursor = "pointer";
+    s.style.fontSize = "12px";
+    s.style.fontWeight = "700";
+    s.style.whiteSpace = "normal";
+    s.style.overflowWrap = "anywhere";
+    const b = document.createElement("div");
+    b.style.padding = "8px";
+    d.append(s, b);
+    return { details: d, body: b };
 }
 
-function buildEditor(node) {
-    const enableWidget = getWidget(node, "启用文字面板", "text_panel_enabled");
-    const topWidget = getWidget(node, "选区上边界(px)", "selection_top_px");
-    const bottomWidget = getWidget(node, "选区下边界(px)", "selection_bottom_px");
-    const bgModeWidget = getWidget(node, "面板背景", "panel_background");
-    const bgColorWidget = getWidget(node, "背景颜色", "background_color");
-    const textWidget = getWidget(node, "文字内容", "text");
-    const textColorWidget = getWidget(node, "文字颜色", "text_color");
-    const fontPathWidget = getWidget(node, "字体名称或路径", "font_name_or_path");
-    const fontSizeWidget = getWidget(node, "字号", "font_size");
-    const paddingWidget = getWidget(node, "内边距", "padding");
-    const lineSpacingWidget = getWidget(node, "行距", "line_spacing");
-    const hAlignWidget = getWidget(node, "水平对齐", "horizontal_align");
-    const vAlignWidget = getWidget(node, "垂直对齐", "vertical_align");
+function buildEditor(node, modern) {
+    const enableW = getWidget(node, "启用文字面板", "text_panel_enabled");
+    const topW = getWidget(node, "选区上边界(px)", "selection_top_px");
+    const bottomW = getWidget(node, "选区下边界(px)", "selection_bottom_px");
+    const regionsW = getWidget(node, "截面列表", "regions_json");
+    const bgModeW = getWidget(node, "面板背景", "panel_background");
+    const bgColorW = getWidget(node, "背景颜色", "background_color");
+    const textW = getWidget(node, "文字内容", "text");
+    const textColorW = getWidget(node, "文字颜色", "text_color");
+    const fontW = getWidget(node, "字体名称或路径", "font_name_or_path");
+    const fontSizeW = getWidget(node, "字号", "font_size");
+    const paddingW = getWidget(node, "内边距", "padding");
+    const lineSpacingW = getWidget(node, "行距", "line_spacing");
+    const hAlignW = getWidget(node, "水平对齐", "horizontal_align");
+    const vAlignW = getWidget(node, "垂直对齐", "vertical_align");
 
-    // 当增强面板可用时，隐藏重复的原生控件；如果 JS 失效，则自动退回原生 UI。
-    [bgModeWidget, bgColorWidget, textWidget, textColorWidget, fontSizeWidget, paddingWidget, lineSpacingWidget, hAlignWidget, vAlignWidget].forEach(hideWidget);
+    [enableW, topW, bottomW, regionsW, bgModeW, bgColorW, textW, textColorW, fontW, fontSizeW, paddingW, lineSpacingW, hAlignW, vAlignW].forEach(hideWidget);
 
     const root = document.createElement("div");
+    root.dataset.hbeUi = modern ? "nodes2" : "classic";
     root.style.width = "100%";
     root.style.boxSizing = "border-box";
-    root.style.padding = "8px";
+    root.style.padding = modern ? "8px 10px" : "8px";
     root.style.display = "flex";
     root.style.flexDirection = "column";
     root.style.gap = "8px";
-    root.style.userSelect = "none";
+    root.style.fontFamily = "inherit";
+    root.style.color = "inherit";
 
+    // 固定可视高度 + 内部滚动，不再要求用户手动拉高整个节点
+    const viewport = document.createElement("div");
+    viewport.style.maxHeight = modern ? "620px" : "560px";
+    viewport.style.height = modern ? "620px" : "560px";
+    viewport.style.overflowY = "auto";
+    viewport.style.overflowX = "hidden";
+    viewport.style.paddingRight = "4px";
+    viewport.style.boxSizing = "border-box";
+    viewport.style.scrollbarGutter = "stable";
+    viewport.style.display = "flex";
+    viewport.style.flexDirection = "column";
+    viewport.style.gap = "8px";
+    root.appendChild(viewport);
+
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.justifyContent = "space-between";
+    header.style.gap = "8px";
     const title = document.createElement("div");
-    title.textContent = "横向区域可视化编辑器";
-    title.style.fontSize = "13px";
+    title.textContent = "横向区域编辑";
+    title.style.fontSize = modern ? "14px" : "13px";
     title.style.fontWeight = "700";
-    title.style.opacity = "0.98";
-    root.appendChild(title);
+    const badge = document.createElement("div");
+    badge.textContent = modern ? "Nodes 2.0" : "经典节点";
+    badge.style.fontSize = "10px";
+    badge.style.opacity = "0.72";
+    header.append(title, badge);
+    viewport.appendChild(header);
 
-    const help = document.createElement("div");
-    help.textContent = "兼容两套使用方式：增强面板（当前页）与原生控件回退。先连接“加载图像”到“输入图像”，再同步预览。";
-    help.style.fontSize = "11px";
-    help.style.opacity = "0.78";
-    root.appendChild(help);
-
-    // 基础控制
-    const basicSection = createSection("一、基础模式", true);
-    root.appendChild(basicSection.details);
-
-    const enableWrap = document.createElement("label");
-    enableWrap.style.display = "flex";
-    enableWrap.style.alignItems = "center";
-    enableWrap.style.justifyContent = "space-between";
-    enableWrap.style.gap = "8px";
-    enableWrap.style.padding = "4px 0";
-
-    const enableLabel = document.createElement("span");
-    enableLabel.textContent = "启用文字面板";
-    enableLabel.style.fontSize = "12px";
-
-    const enableToggle = document.createElement("input");
-    enableToggle.type = "checkbox";
-    enableToggle.checked = Boolean(enableWidget?.value);
-    enableToggle.style.width = "18px";
-    enableToggle.style.height = "18px";
-    enableToggle.addEventListener("change", () => setWidgetValue(enableWidget, enableToggle.checked, node));
-    enableWrap.append(enableLabel, enableToggle);
-    basicSection.body.appendChild(enableWrap);
-
+    const modeSec = section("操作模式", modern, true);
+    viewport.appendChild(modeSec.details);
+    const toggleRow = document.createElement("label");
+    toggleRow.style.display = "flex";
+    toggleRow.style.alignItems = "center";
+    toggleRow.style.justifyContent = "space-between";
+    toggleRow.style.gap = "8px";
+    toggleRow.style.fontSize = "12px";
+    toggleRow.style.whiteSpace = "normal";
+    const toggleText = document.createElement("span");
+    toggleText.textContent = "将截面替换为文字面板";
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.checked = Boolean(enableW?.value);
+    toggle.style.width = "18px";
+    toggle.style.height = "18px";
+    toggle.addEventListener("change", () => setWidgetValue(enableW, toggle.checked, node));
+    toggleRow.append(toggleText, toggle);
+    modeSec.body.appendChild(toggleRow);
     const modeHint = document.createElement("div");
     modeHint.style.fontSize = "11px";
-    modeHint.style.opacity = "0.74";
-    basicSection.body.appendChild(modeHint);
+    modeHint.style.opacity = "0.72";
+    modeHint.style.marginTop = "6px";
+    modeHint.style.whiteSpace = "normal";
+    modeHint.style.overflowWrap = "anywhere";
+    modeSec.body.appendChild(modeHint);
 
-    // 预览区
-    const previewSection = createSection("二、预览与选区", true);
-    root.appendChild(previewSection.details);
+    const previewSec = section("预览与截面", modern, true);
+    viewport.appendChild(previewSec.details);
 
     const buttonRow = document.createElement("div");
     buttonRow.style.display = "grid";
     buttonRow.style.gridTemplateColumns = "1fr 1fr";
     buttonRow.style.gap = "8px";
-
-    function makeButton(label) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.textContent = label;
-        btn.style.height = "32px";
-        btn.style.borderRadius = "6px";
-        btn.style.border = "1px solid rgba(255,255,255,0.18)";
-        btn.style.background = "rgba(255,255,255,0.06)";
-        btn.style.color = "inherit";
-        btn.style.cursor = "pointer";
-        btn.style.fontSize = "12px";
-        return btn;
+    buttonRow.style.marginBottom = "7px";
+    function button(label) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.style.minHeight = "32px";
+        b.style.whiteSpace = "normal";
+        b.style.lineHeight = "1.25";
+        b.style.borderRadius = modern ? "8px" : "6px";
+        b.style.border = "1px solid rgba(255,255,255,0.16)";
+        b.style.background = "rgba(255,255,255,0.06)";
+        b.style.color = "inherit";
+        b.style.cursor = "pointer";
+        b.style.fontSize = "11px";
+        return b;
     }
+    const syncBtn = button("从输入图像同步预览");
+    const refreshBtn = button("刷新预览");
+    buttonRow.append(syncBtn, refreshBtn);
+    previewSec.body.appendChild(buttonRow);
 
-    const btnLoad = makeButton("从输入图像同步预览");
-    const btnReload = makeButton("刷新当前预览");
-    buttonRow.append(btnLoad, btnReload);
-    previewSection.body.appendChild(buttonRow);
-
-    const connInfo = document.createElement("div");
-    connInfo.style.fontSize = "11px";
-    connInfo.style.opacity = "0.76";
-    previewSection.body.appendChild(connInfo);
+    const sourceInfo = document.createElement("div");
+    sourceInfo.style.fontSize = "11px";
+    sourceInfo.style.opacity = "0.72";
+    sourceInfo.style.whiteSpace = "normal";
+    sourceInfo.style.overflowWrap = "anywhere";
+    sourceInfo.style.marginBottom = "7px";
+    previewSec.body.appendChild(sourceInfo);
 
     const canvas = document.createElement("canvas");
     canvas.width = 640;
@@ -254,421 +280,352 @@ function buildEditor(node) {
     canvas.style.width = "100%";
     canvas.style.height = "auto";
     canvas.style.display = "block";
-    canvas.style.border = "1px solid rgba(255,255,255,0.18)";
-    canvas.style.borderRadius = "6px";
-    canvas.style.background = "repeating-conic-gradient(#2a2a2a 0 25%, #333 0 50%) 0 / 16px 16px";
+    canvas.style.border = "1px solid rgba(255,255,255,0.16)";
+    canvas.style.borderRadius = modern ? "9px" : "6px";
+    canvas.style.background = "repeating-conic-gradient(#292929 0 25%, #343434 0 50%) 0 / 16px 16px";
     canvas.style.cursor = "crosshair";
     canvas.style.touchAction = "none";
-    previewSection.body.appendChild(canvas);
+    previewSec.body.appendChild(canvas);
 
     const previewInfo = document.createElement("div");
     previewInfo.style.fontSize = "11px";
-    previewInfo.style.opacity = "0.82";
-    previewSection.body.appendChild(previewInfo);
+    previewInfo.style.opacity = "0.8";
+    previewInfo.style.marginTop = "6px";
+    previewInfo.style.whiteSpace = "normal";
+    previewInfo.style.overflowWrap = "anywhere";
+    previewSec.body.appendChild(previewInfo);
 
-    // 文字面板区
-    const textSection = createSection("三、文字面板设置", true);
-    root.appendChild(textSection.details);
+    const rangeGrid = document.createElement("div");
+    rangeGrid.style.display = "grid";
+    rangeGrid.style.gridTemplateColumns = "1fr 1fr";
+    rangeGrid.style.gap = "8px";
+    rangeGrid.style.marginTop = "8px";
+    const topInput = styleInput(document.createElement("input"), modern);
+    topInput.type = "number";
+    topInput.min = "0";
+    topInput.value = String(topW?.value ?? 0);
+    const bottomInput = styleInput(document.createElement("input"), modern);
+    bottomInput.type = "number";
+    bottomInput.min = "1";
+    bottomInput.value = String(bottomW?.value ?? 1);
+    rangeGrid.append(fieldRow("上边界", topInput, modern), fieldRow("下边界", bottomInput, modern));
+    previewSec.body.appendChild(rangeGrid);
 
-    function makeSelect(options, value) {
-        const select = styleInput(document.createElement("select"));
-        for (const item of options) {
-            const op = document.createElement("option");
-            op.value = item;
-            op.textContent = item;
-            if (item === value) op.selected = true;
-            select.appendChild(op);
-        }
-        return select;
+    const regionActions = document.createElement("div");
+    regionActions.style.display = "grid";
+    regionActions.style.gridTemplateColumns = "1fr 1fr";
+    regionActions.style.gap = "7px";
+    regionActions.style.marginTop = "4px";
+    const addBtn = button("添加当前截面");
+    const updateBtn = button("更新选中截面");
+    const removeBtn = button("移除选中截面");
+    const clearBtn = button("清空全部截面");
+    regionActions.append(addBtn, updateBtn, removeBtn, clearBtn);
+    previewSec.body.appendChild(regionActions);
+
+    const regionList = document.createElement("div");
+    regionList.style.display = "flex";
+    regionList.style.flexDirection = "column";
+    regionList.style.gap = "5px";
+    regionList.style.marginTop = "8px";
+    previewSec.body.appendChild(regionList);
+
+    const textSec = section("文字面板", modern, true);
+    viewport.appendChild(textSec.details);
+    const bgMode = styleInput(document.createElement("select"), modern);
+    for (const v of ["纯色", "透明"]) {
+        const o = document.createElement("option"); o.value = v; o.textContent = v; bgMode.appendChild(o);
     }
+    bgMode.value = String(bgModeW?.value || "纯色");
+    textSec.body.appendChild(fieldRow("面板背景", bgMode, modern));
 
-    function makeNumberInput(value, min, max, step = 1) {
-        const el = styleInput(document.createElement("input"));
-        el.type = "number";
-        el.value = String(value ?? "");
-        el.min = String(min);
-        el.max = String(max);
-        el.step = String(step);
-        return el;
-    }
-
-    function makeColorComposite(initial, defaultValue) {
+    function colorControl(initial, fallback) {
         const wrap = document.createElement("div");
         wrap.style.display = "grid";
-        wrap.style.gridTemplateColumns = "42px 1fr";
+        wrap.style.gridTemplateColumns = "40px 1fr";
         wrap.style.gap = "8px";
-        wrap.style.alignItems = "center";
-
         const picker = document.createElement("input");
         picker.type = "color";
-        picker.value = /^#[0-9a-f]{6}$/i.test(String(initial || "")) ? String(initial) : defaultValue;
-        picker.style.width = "38px";
-        picker.style.height = "28px";
-        picker.style.padding = "0";
-        picker.style.border = "0";
-        picker.style.background = "transparent";
-
-        const text = styleInput(document.createElement("input"));
-        text.type = "text";
-        text.placeholder = defaultValue;
-        text.value = String(initial || defaultValue).toUpperCase();
-
-        function normalize(raw) {
-            let v = String(raw || "").trim().toUpperCase();
-            if (!v.startsWith("#")) v = `#${v}`;
-            return /^#[0-9A-F]{6}$/.test(v) ? v : null;
-        }
-
-        return {
-            wrap,
-            picker,
-            text,
-            get value() {
-                return normalize(text.value) || defaultValue;
-            },
-            set value(v) {
-                const n = normalize(v) || defaultValue;
-                picker.value = n;
-                text.value = n;
-            },
-        };
+        picker.value = /^#[0-9a-f]{6}$/i.test(String(initial || "")) ? String(initial) : fallback;
+        picker.style.width = "38px"; picker.style.height = "30px"; picker.style.border = "0"; picker.style.padding = "0";
+        const hex = styleInput(document.createElement("input"), modern);
+        hex.value = String(initial || fallback).toUpperCase();
+        wrap.append(picker, hex);
+        return { wrap, picker, hex };
     }
+    const bgColor = colorControl(bgColorW?.value, "#FFFFFF");
+    const bgColorRow = fieldRow("背景颜色", bgColor.wrap, modern);
+    textSec.body.appendChild(bgColorRow);
+    const textColor = colorControl(textColorW?.value, "#000000");
+    textSec.body.appendChild(fieldRow("文字颜色", textColor.wrap, modern));
 
-    const bgModeSelect = makeSelect(["纯色", "透明"], String(bgModeWidget?.value || "纯色"));
-    bgModeSelect.addEventListener("change", () => setWidgetValue(bgModeWidget, bgModeSelect.value, node));
-    textSection.body.appendChild(createFieldRow("面板背景", bgModeSelect));
+    const textArea = document.createElement("textarea");
+    textArea.value = String(textW?.value || "");
+    textArea.style.width = "100%";
+    textArea.style.minHeight = "100px";
+    textArea.style.resize = "vertical";
+    textArea.style.boxSizing = "border-box";
+    textArea.style.borderRadius = modern ? "8px" : "6px";
+    textArea.style.border = "1px solid rgba(255,255,255,0.16)";
+    textArea.style.background = "rgba(255,255,255,0.055)";
+    textArea.style.color = "inherit";
+    textArea.style.padding = "8px";
+    textArea.style.whiteSpace = "pre-wrap";
+    textArea.style.overflowWrap = "anywhere";
+    textSec.body.appendChild(fieldRow("文字内容", textArea, modern));
 
-    const bgColorComp = makeColorComposite(bgColorWidget?.value, "#FFFFFF");
-    bgColorComp.wrap.append(bgColorComp.picker, bgColorComp.text);
-    bgColorComp.picker.addEventListener("input", () => {
-        bgColorComp.text.value = bgColorComp.picker.value.toUpperCase();
-        setWidgetValue(bgColorWidget, bgColorComp.picker.value.toUpperCase(), node);
-    });
-    bgColorComp.text.addEventListener("change", () => {
-        bgColorComp.value = bgColorComp.text.value;
-        setWidgetValue(bgColorWidget, bgColorComp.value, node);
-    });
-    textSection.body.appendChild(createFieldRow("背景颜色", bgColorComp.wrap));
-
-    const textColorComp = makeColorComposite(textColorWidget?.value, "#000000");
-    textColorComp.wrap.append(textColorComp.picker, textColorComp.text);
-    textColorComp.picker.addEventListener("input", () => {
-        textColorComp.text.value = textColorComp.picker.value.toUpperCase();
-        setWidgetValue(textColorWidget, textColorComp.picker.value.toUpperCase(), node);
-    });
-    textColorComp.text.addEventListener("change", () => {
-        textColorComp.value = textColorComp.text.value;
-        setWidgetValue(textColorWidget, textColorComp.value, node);
-    });
-    textSection.body.appendChild(createFieldRow("文字颜色", textColorComp.wrap));
-
-    const textArea = styleTextArea(document.createElement("textarea"));
-    textArea.value = String(textWidget?.value || "");
-    textArea.placeholder = "在这里输入文字";
-    textArea.addEventListener("input", () => setWidgetValue(textWidget, textArea.value, node));
-    textSection.body.appendChild(createFieldRow("文字内容", textArea));
-
-    const typographySection = createSection("四、高级排版设置", false);
-    root.appendChild(typographySection.details);
-
-    const fontSizeInput = makeNumberInput(fontSizeWidget?.value ?? 48, 1, 1024, 1);
-    fontSizeInput.addEventListener("change", () => setWidgetValue(fontSizeWidget, Number(fontSizeInput.value || 48), node));
-    typographySection.body.appendChild(createFieldRow("字号", fontSizeInput));
-
-    const paddingInput = makeNumberInput(paddingWidget?.value ?? 24, 0, 2048, 1);
-    paddingInput.addEventListener("change", () => setWidgetValue(paddingWidget, Number(paddingInput.value || 24), node));
-    typographySection.body.appendChild(createFieldRow("内边距", paddingInput));
-
-    const lineSpacingInput = makeNumberInput(lineSpacingWidget?.value ?? 8, 0, 1024, 1);
-    lineSpacingInput.addEventListener("change", () => setWidgetValue(lineSpacingWidget, Number(lineSpacingInput.value || 8), node));
-    typographySection.body.appendChild(createFieldRow("行距", lineSpacingInput));
-
-    const hAlignSelect = makeSelect(["居中", "左对齐", "右对齐"], String(hAlignWidget?.value || "居中"));
-    hAlignSelect.addEventListener("change", () => setWidgetValue(hAlignWidget, hAlignSelect.value, node));
-    typographySection.body.appendChild(createFieldRow("水平对齐", hAlignSelect));
-
-    const vAlignSelect = makeSelect(["居中", "顶部", "底部"], String(vAlignWidget?.value || "居中"));
-    vAlignSelect.addEventListener("change", () => setWidgetValue(vAlignWidget, vAlignSelect.value, node));
-    typographySection.body.appendChild(createFieldRow("垂直对齐", vAlignSelect));
-
-    const fontTip = document.createElement("div");
-    fontTip.style.fontSize = "11px";
-    fontTip.style.opacity = "0.72";
-    fontTip.textContent = `字体路径仍保留在原生控件中，当前值：${String(fontPathWidget?.value || "SimHei")}`;
-    typographySection.body.appendChild(fontTip);
-
-    const footerSection = createSection("五、兼容说明", false);
-    root.appendChild(footerSection.details);
-    const footerText = document.createElement("div");
-    footerText.style.fontSize = "11px";
-    footerText.style.opacity = "0.74";
-    footerText.innerHTML = [
-        "1. 当前增强面板用于新版 UI。<br>",
-        "2. 若前端脚本未加载，原生控件仍可直接使用。<br>",
-        "3. 本版本已移除节点内置上传控件，因此不会再出现双预览。",
-    ].join("");
-    footerSection.body.appendChild(footerText);
+    const typographySec = section("排版", modern, false);
+    viewport.appendChild(typographySec.details);
+    const fontInput = styleInput(document.createElement("input"), modern);
+    fontInput.value = String(fontW?.value || "SimHei");
+    typographySec.body.appendChild(fieldRow("字体", fontInput, modern));
+    function numberInput(value, min, max) {
+        const el = styleInput(document.createElement("input"), modern);
+        el.type = "number"; el.value = String(value); el.min = String(min); el.max = String(max); el.step = "1"; return el;
+    }
+    const fontSize = numberInput(fontSizeW?.value ?? 48, 1, 1024);
+    const padding = numberInput(paddingW?.value ?? 24, 0, 2048);
+    const spacing = numberInput(lineSpacingW?.value ?? 8, 0, 1024);
+    typographySec.body.appendChild(fieldRow("字号", fontSize, modern));
+    typographySec.body.appendChild(fieldRow("内边距", padding, modern));
+    typographySec.body.appendChild(fieldRow("行距", spacing, modern));
+    const hAlign = styleInput(document.createElement("select"), modern);
+    ["居中", "左对齐", "右对齐"].forEach((v) => { const o=document.createElement("option"); o.value=v; o.textContent=v; hAlign.appendChild(o); });
+    hAlign.value = String(hAlignW?.value || "居中");
+    const vAlign = styleInput(document.createElement("select"), modern);
+    ["居中", "顶部", "底部"].forEach((v) => { const o=document.createElement("option"); o.value=v; o.textContent=v; vAlign.appendChild(o); });
+    vAlign.value = String(vAlignW?.value || "居中");
+    typographySec.body.appendChild(fieldRow("水平对齐", hAlign, modern));
+    typographySec.body.appendChild(fieldRow("垂直对齐", vAlign, modern));
 
     const state = {
         img: null,
         dragging: false,
         anchorY: 0,
-        lastFilename: null,
         displayRect: { x: 0, y: 0, w: 1, h: 1 },
+        selectedRegionIndex: -1,
+        filename: null,
     };
 
-    function updateDynamicVisibility() {
-        const enabled = Boolean(enableWidget?.value);
-        enableToggle.checked = enabled;
-        textSection.details.style.display = enabled ? "block" : "none";
-        typographySection.details.style.display = enabled ? "block" : "none";
-        modeHint.textContent = enabled
-            ? "当前模式：将选区替换为文字面板。文字设置与高级排版区已展开。"
-            : "当前模式：删除选区，并将上下图像直接拼接。文字相关设置已自动隐藏。";
-        const bgMode = String(bgModeWidget?.value || "纯色");
-        bgColorComp.wrap.parentElement.style.display = bgMode === "透明" ? "none" : "grid";
+    function activeRange() {
+        const h = state.img?.naturalHeight || 16384;
+        let a = Math.round(Number(topW?.value ?? topInput.value ?? 0));
+        let b = Math.round(Number(bottomW?.value ?? bottomInput.value ?? 1));
+        a = Math.max(0, Math.min(h - 1, a));
+        b = Math.max(a + 1, Math.min(h, b));
+        return [a, b];
     }
 
-    function refreshConnectionInfo() {
-        const found = getConnectedPreviewFilename(node);
-        connInfo.textContent = found
-            ? `当前预览来源：${found.nodeTitle} → ${found.filename}`
-            : "当前未检测到可读取文件名的上游“加载图像”节点。";
+    function savedRegions() {
+        const h = state.img?.naturalHeight || Infinity;
+        return normalizeRegions(parseRegions(regionsW?.value), h);
     }
 
-    function currentSelection() {
-        const h = state.img?.naturalHeight || state.img?.height || 1;
-        let y1 = Math.round(Number(topWidget?.value ?? 0));
-        let y2 = Math.round(Number(bottomWidget?.value ?? 1));
-        y1 = Math.max(0, Math.min(h - 1, y1));
-        y2 = Math.max(y1 + 1, Math.min(h, y2));
-        return [y1, y2];
-    }
-
-    function drawPreview() {
-        const ctx = canvas.getContext("2d");
-        const cssWidth = Math.max(320, Math.floor(root.getBoundingClientRect().width || 400));
-        const dpr = Math.max(1, window.devicePixelRatio || 1);
-
-        let cssHeight = 240;
-        if (state.img?.naturalWidth && state.img?.naturalHeight) {
-            cssHeight = Math.max(170, Math.min(520, (cssWidth * state.img.naturalHeight) / state.img.naturalWidth));
+    function renderRegionList() {
+        regionList.innerHTML = "";
+        const regions = savedRegions();
+        if (!regions.length) {
+            const empty = document.createElement("div");
+            empty.textContent = "尚未保存多个截面；执行时会使用当前蓝色选区。";
+            empty.style.fontSize = "11px";
+            empty.style.opacity = "0.68";
+            empty.style.whiteSpace = "normal";
+            regionList.appendChild(empty);
+            return;
         }
-        canvas.style.height = `${cssHeight}px`;
-        canvas.width = Math.max(1, Math.floor(cssWidth * dpr));
-        canvas.height = Math.max(1, Math.floor(cssHeight * dpr));
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, cssWidth, cssHeight);
+        regions.forEach(([a, b], idx) => {
+            const item = document.createElement("button");
+            item.type = "button";
+            item.textContent = `截面 ${a}–${b}px（${b-a}px）`;
+            item.style.textAlign = "left";
+            item.style.whiteSpace = "normal";
+            item.style.overflowWrap = "anywhere";
+            item.style.padding = "6px 8px";
+            item.style.borderRadius = "6px";
+            item.style.border = idx === state.selectedRegionIndex ? "1px solid rgba(100,190,255,.95)" : "1px solid rgba(255,255,255,.12)";
+            item.style.background = idx === state.selectedRegionIndex ? "rgba(80,150,240,.16)" : "rgba(255,255,255,.035)";
+            item.style.color = "inherit";
+            item.style.cursor = "pointer";
+            item.addEventListener("click", () => {
+                state.selectedRegionIndex = idx;
+                setWidgetValue(topW, a, node);
+                setWidgetValue(bottomW, b, node);
+                topInput.value = String(a); bottomInput.value = String(b);
+                renderRegionList(); draw();
+            });
+            regionList.appendChild(item);
+        });
+    }
 
-        if (!state.img?.complete || !state.img?.naturalWidth) {
-            ctx.fillStyle = "rgba(255,255,255,0.75)";
-            ctx.font = "13px sans-serif";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            ctx.fillText("请先从输入图像同步预览", cssWidth / 2, cssHeight / 2);
-            state.displayRect = { x: 0, y: 0, w: cssWidth, h: cssHeight };
+    function dynamicUI() {
+        const enabled = Boolean(enableW?.value);
+        toggle.checked = enabled;
+        textSec.details.style.display = enabled ? "block" : "none";
+        typographySec.details.style.display = enabled ? "block" : "none";
+        modeHint.textContent = enabled
+            ? "所有已保存截面都会替换为同一套文字面板；文字过高时分别自动扩展。"
+            : "所有已保存截面都会被删除，然后将剩余图像按原顺序拼接。";
+        bgColorRow.style.display = String(bgModeW?.value || "纯色") === "透明" ? "none" : "grid";
+    }
+
+    function refreshSource() {
+        const src = getConnectedLoadImage(node);
+        sourceInfo.textContent = src ? `预览来源：${src.title} → ${src.filename}` : "未检测到可直接读取文件名的“加载图像”上游节点。";
+        return src;
+    }
+
+    function draw() {
+        const ctx = canvas.getContext("2d");
+        const cssW = Math.max(320, Math.floor(previewSec.body.getBoundingClientRect().width || 400));
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        let cssH = 220;
+        if (state.img?.naturalWidth && state.img?.naturalHeight) cssH = Math.max(170, Math.min(430, cssW * state.img.naturalHeight / state.img.naturalWidth));
+        canvas.style.height = `${cssH}px`;
+        canvas.width = Math.floor(cssW * dpr); canvas.height = Math.floor(cssH * dpr);
+        ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cssW,cssH);
+        if (!state.img?.naturalWidth) {
+            ctx.fillStyle = "rgba(255,255,255,.72)"; ctx.font = "13px sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+            ctx.fillText("请先同步输入图像预览", cssW/2, cssH/2);
             previewInfo.textContent = "未加载预览图像";
             return;
         }
+        const scale = Math.min(cssW/state.img.naturalWidth, cssH/state.img.naturalHeight);
+        const dw = state.img.naturalWidth*scale, dh = state.img.naturalHeight*scale, dx=(cssW-dw)/2, dy=(cssH-dh)/2;
+        state.displayRect = {x:dx,y:dy,w:dw,h:dh}; ctx.drawImage(state.img,dx,dy,dw,dh);
 
-        const scale = Math.min(cssWidth / state.img.naturalWidth, cssHeight / state.img.naturalHeight);
-        const dw = state.img.naturalWidth * scale;
-        const dh = state.img.naturalHeight * scale;
-        const dx = (cssWidth - dw) / 2;
-        const dy = (cssHeight - dh) / 2;
-        state.displayRect = { x: dx, y: dy, w: dw, h: dh };
-
-        ctx.drawImage(state.img, dx, dy, dw, dh);
-
-        const [y1, y2] = currentSelection();
-        const sy1 = dy + (y1 / state.img.naturalHeight) * dh;
-        const sy2 = dy + (y2 / state.img.naturalHeight) * dh;
-
-        ctx.fillStyle = "rgba(0,0,0,0.38)";
-        ctx.fillRect(dx, dy, dw, Math.max(0, sy1 - dy));
-        ctx.fillRect(dx, sy2, dw, Math.max(0, dy + dh - sy2));
-        ctx.fillStyle = "rgba(70, 160, 255, 0.20)";
-        ctx.fillRect(dx, sy1, dw, Math.max(1, sy2 - sy1));
-        ctx.strokeStyle = "rgba(100, 190, 255, 0.98)";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(dx + 1, sy1, Math.max(1, dw - 2), Math.max(1, sy2 - sy1));
-
-        const label = `Y: ${y1} → ${y2} ｜ 高度 ${y2 - y1}px`;
-        ctx.fillStyle = "rgba(10,10,10,0.78)";
-        ctx.font = "12px sans-serif";
-        const m = ctx.measureText(label);
-        const lx = dx + 6;
-        const ly = Math.max(dy + 4, Math.min(sy1 + 4, dy + dh - 26));
-        ctx.fillRect(lx, ly, m.width + 12, 22);
-        ctx.fillStyle = "white";
-        ctx.textAlign = "left";
-        ctx.textBaseline = "middle";
-        ctx.fillText(label, lx + 6, ly + 11);
-
-        previewInfo.textContent = `预览图尺寸 ${state.img.naturalWidth}×${state.img.naturalHeight}；当前选区高度 ${y2 - y1}px。`;
+        for (const [a,b] of savedRegions()) {
+            const y1=dy+a/state.img.naturalHeight*dh, y2=dy+b/state.img.naturalHeight*dh;
+            ctx.fillStyle="rgba(255,176,64,.20)"; ctx.fillRect(dx,y1,dw,Math.max(1,y2-y1));
+            ctx.strokeStyle="rgba(255,190,80,.9)"; ctx.lineWidth=1.5; ctx.strokeRect(dx+1,y1,Math.max(1,dw-2),Math.max(1,y2-y1));
+        }
+        const [a,b]=activeRange(); const y1=dy+a/state.img.naturalHeight*dh, y2=dy+b/state.img.naturalHeight*dh;
+        ctx.fillStyle="rgba(70,160,255,.18)"; ctx.fillRect(dx,y1,dw,Math.max(1,y2-y1));
+        ctx.strokeStyle="rgba(100,190,255,.98)"; ctx.lineWidth=2; ctx.strokeRect(dx+1,y1,Math.max(1,dw-2),Math.max(1,y2-y1));
+        previewInfo.textContent = `图像 ${state.img.naturalWidth}×${state.img.naturalHeight}；当前选区 ${a}–${b}px；已保存 ${savedRegions().length} 个截面。`;
     }
 
-    function canvasYToImageY(clientY) {
+    function clientYToImageY(clientY) {
         if (!state.img?.naturalHeight) return 0;
-        const rect = canvas.getBoundingClientRect();
-        const cy = clientY - rect.top;
-        const dr = state.displayRect;
-        const clamped = Math.max(dr.y, Math.min(dr.y + dr.h, cy));
-        const t = dr.h > 0 ? (clamped - dr.y) / dr.h : 0;
-        return Math.round(t * state.img.naturalHeight);
+        const r=canvas.getBoundingClientRect(), cy=clientY-r.top, d=state.displayRect;
+        const clamped=Math.max(d.y,Math.min(d.y+d.h,cy));
+        return Math.round(((clamped-d.y)/Math.max(1,d.h))*state.img.naturalHeight);
     }
 
-    function commitSelection(a, b) {
+    function setActive(a,b) {
         if (!state.img?.naturalHeight) return;
-        const h = state.img.naturalHeight;
-        let y1 = Math.round(Math.min(a, b));
-        let y2 = Math.round(Math.max(a, b));
-        y1 = Math.max(0, Math.min(h - 1, y1));
-        y2 = Math.max(y1 + 1, Math.min(h, y2));
-        setWidgetValue(topWidget, y1, node);
-        setWidgetValue(bottomWidget, y2, node);
-        drawPreview();
+        const h=state.img.naturalHeight;
+        let y1=Math.round(Math.min(a,b)), y2=Math.round(Math.max(a,b));
+        y1=Math.max(0,Math.min(h-1,y1)); y2=Math.max(y1+1,Math.min(h,y2));
+        setWidgetValue(topW,y1,node); setWidgetValue(bottomW,y2,node);
+        topInput.value=String(y1); bottomInput.value=String(y2); draw();
     }
 
-    function loadPreviewByFilename(filename, force = false) {
-        if (!filename) {
-            state.img = null;
-            state.lastFilename = null;
-            drawPreview();
-            refreshConnectionInfo();
-            return;
-        }
-        if (!force && state.lastFilename === filename && state.img) {
-            drawPreview();
-            refreshConnectionInfo();
-            return;
-        }
-        state.lastFilename = filename;
-
-        const img = new Image();
-        img.onload = () => {
-            state.img = img;
-            const h = img.naturalHeight;
-            const currentTop = Number(topWidget?.value ?? 0);
-            const currentBottom = Number(bottomWidget?.value ?? 1);
-            if (!Number.isFinite(currentTop) || !Number.isFinite(currentBottom) || currentTop < 0 || currentBottom <= currentTop || currentBottom > h || (currentTop === 0 && currentBottom <= 1)) {
-                const y1 = Math.floor(h / 3);
-                const y2 = Math.max(y1 + 1, Math.ceil((h * 2) / 3));
-                setWidgetValue(topWidget, y1, node);
-                setWidgetValue(bottomWidget, Math.min(h, y2), node);
-            }
-            drawPreview();
-            refreshConnectionInfo();
-            requestAnimationFrame(() => node.setSize?.([Math.max(node.size?.[0] || NODE_MIN_W, NODE_MIN_W), Math.max(node.size?.[1] || NODE_MIN_H, NODE_MIN_H)]));
+    function loadPreview(force=true) {
+        const src=refreshSource();
+        if (!src?.filename) { previewInfo.textContent="只有上游为“加载图像”时才能直接同步预览；后端 IMAGE 输入仍可正常执行。"; return; }
+        if (!force && state.filename===src.filename && state.img) { draw(); return; }
+        state.filename=src.filename;
+        const img=new Image();
+        img.onload=()=>{
+            state.img=img;
+            const [a,b]=activeRange();
+            if ((Number(topW?.value)||0)===0 && (Number(bottomW?.value)||1)<=1) setActive(Math.floor(img.naturalHeight/3),Math.ceil(img.naturalHeight*2/3));
+            else setActive(a,b);
+            renderRegionList(); draw();
         };
-        img.onerror = () => {
-            state.img = null;
-            previewInfo.textContent = "预览图像加载失败；后端执行时仍会使用“输入图像”处理。";
-            refreshConnectionInfo();
-            drawPreview();
-        };
-        img.src = `${makeViewUrl(filename)}&rand=${Date.now()}`;
+        img.onerror=()=>{ state.img=null; previewInfo.textContent="预览读取失败。"; draw(); };
+        img.src=`${makeViewUrl(src.filename)}&rand=${Date.now()}`;
     }
 
-    function syncPreviewFromConnection(force = true) {
-        const found = getConnectedPreviewFilename(node);
-        if (!found?.filename) {
-            previewInfo.textContent = "未找到可读取文件名的上游“加载图像”节点；若上游不是 Load Image，则只能使用原生控件处理。";
-            refreshConnectionInfo();
-            return;
-        }
-        loadPreviewByFilename(found.filename, force);
-    }
+    canvas.addEventListener("pointerdown",(e)=>{ if(!state.img)return; state.dragging=true; state.anchorY=clientYToImageY(e.clientY); canvas.setPointerCapture?.(e.pointerId); setActive(state.anchorY,state.anchorY+1); e.preventDefault(); });
+    canvas.addEventListener("pointermove",(e)=>{ if(!state.dragging)return; setActive(state.anchorY,clientYToImageY(e.clientY)); e.preventDefault(); });
+    const end=(e)=>{ if(!state.dragging)return; state.dragging=false; try{canvas.releasePointerCapture?.(e.pointerId)}catch(_){} e.preventDefault(); };
+    canvas.addEventListener("pointerup",end); canvas.addEventListener("pointercancel",end);
 
-    btnLoad.addEventListener("click", () => syncPreviewFromConnection(true));
-    btnReload.addEventListener("click", () => syncPreviewFromConnection(true));
+    syncBtn.addEventListener("click",()=>loadPreview(true)); refreshBtn.addEventListener("click",()=>loadPreview(true));
+    topInput.addEventListener("change",()=>setActive(Number(topInput.value),Number(bottomInput.value)));
+    bottomInput.addEventListener("change",()=>setActive(Number(topInput.value),Number(bottomInput.value)));
 
-    canvas.addEventListener("pointerdown", (e) => {
-        if (!state.img?.naturalHeight) return;
-        canvas.setPointerCapture?.(e.pointerId);
-        state.dragging = true;
-        state.anchorY = canvasYToImageY(e.clientY);
-        commitSelection(state.anchorY, state.anchorY + 1);
-        e.preventDefault();
+    addBtn.addEventListener("click",()=>{
+        const h=state.img?.naturalHeight||Infinity;
+        const next=normalizeRegions([...savedRegions(),activeRange()],h);
+        writeRegions(regionsW,next,node); state.selectedRegionIndex=Math.max(0,next.findIndex(([a,b])=>a<=activeRange()[0]&&b>=activeRange()[1])); renderRegionList(); draw();
     });
-    canvas.addEventListener("pointermove", (e) => {
-        if (!state.dragging) return;
-        commitSelection(state.anchorY, canvasYToImageY(e.clientY));
-        e.preventDefault();
+    updateBtn.addEventListener("click",()=>{
+        const regs=savedRegions(); if(state.selectedRegionIndex<0||state.selectedRegionIndex>=regs.length)return;
+        regs[state.selectedRegionIndex]=activeRange(); const next=normalizeRegions(regs,state.img?.naturalHeight||Infinity);
+        writeRegions(regionsW,next,node); state.selectedRegionIndex=Math.min(state.selectedRegionIndex,next.length-1); renderRegionList(); draw();
     });
-    function endDrag(e) {
-        if (!state.dragging) return;
-        state.dragging = false;
-        try { canvas.releasePointerCapture?.(e.pointerId); } catch (_) {}
-        e.preventDefault();
+    removeBtn.addEventListener("click",()=>{
+        const regs=savedRegions(); if(state.selectedRegionIndex<0||state.selectedRegionIndex>=regs.length)return;
+        regs.splice(state.selectedRegionIndex,1); writeRegions(regionsW,regs,node); state.selectedRegionIndex=Math.min(state.selectedRegionIndex,regs.length-1); renderRegionList(); draw();
+    });
+    clearBtn.addEventListener("click",()=>{ writeRegions(regionsW,[],node); state.selectedRegionIndex=-1; renderRegionList(); draw(); });
+
+    bgMode.addEventListener("change",()=>setWidgetValue(bgModeW,bgMode.value,node));
+    function bindColor(comp, widget) {
+        comp.picker.addEventListener("input",()=>{comp.hex.value=comp.picker.value.toUpperCase();setWidgetValue(widget,comp.hex.value,node)});
+        comp.hex.addEventListener("change",()=>{let v=comp.hex.value.trim().toUpperCase();if(!v.startsWith("#"))v="#"+v;if(/^#[0-9A-F]{6}$/.test(v)){comp.hex.value=v;comp.picker.value=v;setWidgetValue(widget,v,node)}});
     }
-    canvas.addEventListener("pointerup", endDrag);
-    canvas.addEventListener("pointercancel", endDrag);
+    bindColor(bgColor,bgColorW); bindColor(textColor,textColorW);
+    textArea.addEventListener("input",()=>setWidgetValue(textW,textArea.value,node));
+    fontInput.addEventListener("change",()=>setWidgetValue(fontW,fontInput.value,node));
+    fontSize.addEventListener("change",()=>setWidgetValue(fontSizeW,Number(fontSize.value||48),node));
+    padding.addEventListener("change",()=>setWidgetValue(paddingW,Number(padding.value||24),node));
+    spacing.addEventListener("change",()=>setWidgetValue(lineSpacingW,Number(spacing.value||8),node));
+    hAlign.addEventListener("change",()=>setWidgetValue(hAlignW,hAlign.value,node));
+    vAlign.addEventListener("change",()=>setWidgetValue(vAlignW,vAlign.value,node));
 
-    bindWidgetSync(enableWidget, updateDynamicVisibility);
-    bindWidgetSync(bgModeWidget, () => { bgModeSelect.value = String(bgModeWidget?.value || "纯色"); updateDynamicVisibility(); });
-    bindWidgetSync(bgColorWidget, () => { bgColorComp.value = String(bgColorWidget?.value || "#FFFFFF"); });
-    bindWidgetSync(textColorWidget, () => { textColorComp.value = String(textColorWidget?.value || "#000000"); });
-    bindWidgetSync(textWidget, () => { if (textArea.value !== String(textWidget?.value || "")) textArea.value = String(textWidget?.value || ""); });
-    bindWidgetSync(fontSizeWidget, () => { fontSizeInput.value = String(fontSizeWidget?.value ?? 48); });
-    bindWidgetSync(paddingWidget, () => { paddingInput.value = String(paddingWidget?.value ?? 24); });
-    bindWidgetSync(lineSpacingWidget, () => { lineSpacingInput.value = String(lineSpacingWidget?.value ?? 8); });
-    bindWidgetSync(hAlignWidget, () => { hAlignSelect.value = String(hAlignWidget?.value || "居中"); });
-    bindWidgetSync(vAlignWidget, () => { vAlignSelect.value = String(vAlignWidget?.value || "居中"); });
-    [topWidget, bottomWidget].forEach((w) => bindWidgetSync(w, drawPreview));
+    bindWidgetSync(enableW,dynamicUI);
+    bindWidgetSync(bgModeW,()=>{bgMode.value=String(bgModeW?.value||"纯色");dynamicUI()});
+    bindWidgetSync(regionsW,()=>{renderRegionList();draw()});
+    bindWidgetSync(topW,()=>{topInput.value=String(topW?.value??0);draw()});
+    bindWidgetSync(bottomW,()=>{bottomInput.value=String(bottomW?.value??1);draw()});
 
-    const ro = new ResizeObserver(() => drawPreview());
-    ro.observe(root);
-
-    node._horizontalBandEditorCleanup = () => ro.disconnect();
-    node._horizontalBandEditorReload = () => {
-        updateDynamicVisibility();
-        refreshConnectionInfo();
-        fontTip.textContent = `字体路径仍保留在原生控件中，当前值：${String(fontPathWidget?.value || "SimHei")}`;
-        syncPreviewFromConnection(false);
-    };
-
-    requestAnimationFrame(() => node._horizontalBandEditorReload?.());
+    dynamicUI(); renderRegionList(); refreshSource();
+    const ro=new ResizeObserver(()=>draw()); ro.observe(root);
+    node._hbeCleanup=()=>ro.disconnect();
+    node._hbeReload=()=>{dynamicUI();renderRegionList();refreshSource();loadPreview(false)};
+    requestAnimationFrame(()=>node._hbeReload?.());
     return root;
+}
+
+function mountEditor(node) {
+    if (node._hbeMounted) return;
+    node._hbeMounted = true;
+    const modern = isNodes2Enabled();
+    const root = buildEditor(node, modern);
+    const fixedHeight = modern ? 640 : 580;
+    const widget = node.addDOMWidget(
+        modern ? "horizontal_band_editor_nodes2" : "horizontal_band_editor_classic",
+        "custom",
+        root,
+        {
+            serialize: false,
+            hideOnZoom: false,
+            getHeight: () => fixedHeight,
+            getMinHeight: () => fixedHeight,
+            getMaxHeight: () => fixedHeight,
+            margin: modern ? 6 : 8,
+        }
+    );
+    node._hbeDomWidget = widget;
+    requestAnimationFrame(() => {
+        const minW = modern ? 470 : 440;
+        const minH = modern ? 730 : 680;
+        node.setSize?.([Math.max(node.size?.[0] || minW, minW), Math.max(node.size?.[1] || minH, minH)]);
+    });
 }
 
 app.registerExtension({
     name: "OpenAI.HorizontalBandEditor",
-    async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== NODE_NAME) return;
-
-        const originalCreated = nodeType.prototype.onNodeCreated;
-        nodeType.prototype.onNodeCreated = function () {
-            const result = originalCreated?.apply(this, arguments);
-            if (!this._horizontalBandEditorWidget) {
-                const element = buildEditor(this);
-                this._horizontalBandEditorWidget = this.addDOMWidget("horizontal_band_visual_editor", "horizontal_band_visual_editor", element, {
-                    serialize: false,
-                    hideOnZoom: false,
-                });
-                this.setSize?.([Math.max(this.size?.[0] || NODE_MIN_W, NODE_MIN_W), Math.max(this.size?.[1] || NODE_MIN_H, NODE_MIN_H)]);
-            }
-            return result;
-        };
-
-        const originalConfigured = nodeType.prototype.onConfigure;
-        nodeType.prototype.onConfigure = function () {
-            const result = originalConfigured?.apply(this, arguments);
-            requestAnimationFrame(() => this._horizontalBandEditorReload?.());
-            return result;
-        };
-
-        const originalConnectionsChange = nodeType.prototype.onConnectionsChange;
-        nodeType.prototype.onConnectionsChange = function () {
-            const result = originalConnectionsChange?.apply(this, arguments);
-            requestAnimationFrame(() => this._horizontalBandEditorReload?.());
-            return result;
-        };
-
-        const originalRemoved = nodeType.prototype.onRemoved;
-        nodeType.prototype.onRemoved = function () {
-            this._horizontalBandEditorCleanup?.();
-            return originalRemoved?.apply(this, arguments);
-        };
+    async nodeCreated(node) {
+        if (node?.comfyClass !== NODE_NAME && node?.type !== NODE_NAME) return;
+        mountEditor(node);
+    },
+    async afterConfigureGraph() {
+        for (const node of app.graph?._nodes || []) {
+            if (node?.comfyClass === NODE_NAME || node?.type === NODE_NAME) node._hbeReload?.();
+        }
     },
 });
