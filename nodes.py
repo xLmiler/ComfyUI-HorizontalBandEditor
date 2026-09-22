@@ -733,6 +733,8 @@ def _prepare_cover_inner_webp_frames(
 
     frames.extend(normalized_inner)
 
+    # 表图是真正的首帧封面，而不是依靠长时间 duration 伪装静态。
+    # 静态缩略图若只读取第 1 帧，就会一直显示表图；真正播放动画时才进入里图。
     durations = [1] * cover_frame_count
     if len(normalized_inner) == 1:
         durations.append(600_000)
@@ -740,6 +742,43 @@ def _prepare_cover_inner_webp_frames(
         durations.extend([100] * len(normalized_inner))
 
     return frames, durations, target_size
+
+
+def _resolve_inner_frame_durations(frame_count: int, media_info: dict, inherit_gif_timing: bool,
+                                   custom_frame_duration_ms: int, playback_speed: float):
+    frame_count = max(1, int(frame_count))
+    speed = max(0.05, float(playback_speed or 1.0))
+    custom_ms = max(1, int(custom_frame_duration_ms or 100))
+
+    source_durations = []
+    if inherit_gif_timing and bool((media_info or {}).get("is_gif")):
+        raw = (media_info or {}).get("gif_durations_ms", []) or []
+        if len(raw) >= frame_count:
+            source_durations = [max(1, int(v or custom_ms)) for v in raw[:frame_count]]
+
+    if not source_durations:
+        source_durations = [custom_ms] * frame_count
+
+    # 倍速 > 1 表示更快，因此每帧持续时间缩短；倍速 < 1 表示更慢。
+    return [max(1, int(round(ms / speed))) for ms in source_durations]
+
+
+def _subsample_animation_frames(frames: List[Image.Image], durations: List[int], step: int):
+    """
+    每 step 帧保留 1 帧，并把被跳过帧的时长累加到保留帧。
+    这样能显著降低动画 WebP 的帧数/文件体积，同时大致保持总播放时长。
+    """
+    step = max(1, int(step or 1))
+    if step <= 1 or len(frames) <= 1:
+        return list(frames), list(durations)
+
+    out_frames = []
+    out_durations = []
+    for start in range(0, len(frames), step):
+        end = min(len(frames), start + step)
+        out_frames.append(frames[start])
+        out_durations.append(max(1, int(sum(durations[start:end]))))
+    return out_frames, out_durations
 
 
 def _native_json_dumps(value):
@@ -1034,7 +1073,7 @@ def _extract_cover_inner_info(metadata: dict):
 
 
 def _save_frames_as_webp(frames: List[Image.Image], durations: List[int], out_path: str,
-                         quality: int, lossless: bool, extra_save_kwargs=None):
+                         quality: int, lossless: bool, extra_save_kwargs=None, loop_count: int = 1):
     if len(frames) < 2:
         raise RuntimeError("至少需要 2 帧才能保存为动画 WebP。")
     if len(frames) != len(durations):
@@ -1046,8 +1085,8 @@ def _save_frames_as_webp(frames: List[Image.Image], durations: List[int], out_pa
         rgba = frame.convert("RGBA")
         if rgba.size != base_size:
             raise RuntimeError(f"第 {idx + 1} 帧尺寸不一致：{rgba.size}，预期 {base_size}")
-        if normalized and ImageChops.difference(normalized[-1], rgba).getbbox() is None:
-            rgba = _make_distinct_duplicate_frame(rgba, (idx % 253) + 1)
+        # 不再强制修改所有重复里图帧。重复帧让 WebP 编码器自行优化，
+        # 可以显著降低 GIF/动画转 WebP 的体积。表图重复帧在前面的准备阶段已单独防合并。
         normalized.append(rgba)
 
     save_kwargs = {
@@ -1055,7 +1094,7 @@ def _save_frames_as_webp(frames: List[Image.Image], durations: List[int], out_pa
         "save_all": True,
         "append_images": normalized[1:],
         "duration": durations,
-        "loop": 1,
+        "loop": max(0, min(65535, int(loop_count))),
         "lossless": bool(lossless),
         "method": 6,
         "exact": True,
@@ -1232,7 +1271,26 @@ class SaveCoverInnerWebPWithSourceWorkflow:
                     "default": "#FFFFFF", "multiline": False,
                     "tooltip": "当表图输入未连接时，自动使用该纯色作为表图占位。",
                 }),
-                "WebP质量": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
+                "继承GIF原始帧时长": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "继承 GIF 原始速率",
+                    "label_off": "使用自定义帧时长",
+                    "tooltip": "当里图直接来自 GIF 时，读取 GIF 每帧 duration。关闭后统一使用自定义帧时长。",
+                }),
+                "自定义帧时长(ms)": ("INT", {
+                    "default": 100, "min": 1, "max": 60000, "step": 1,
+                    "tooltip": "非 GIF、无法取得 GIF 时长、或关闭继承时使用。100ms = 10 FPS，50ms = 20 FPS。",
+                }),
+                "播放速度倍率": ("FLOAT", {
+                    "default": 1.0, "min": 0.05, "max": 20.0, "step": 0.05,
+                    "tooltip": "1.0=原速；2.0=2倍速；0.5=半速。对 GIF 原始时长和自定义帧时长都生效。",
+                }),
+                "动画抽帧步长": ("INT", {
+                    "default": 1, "min": 1, "max": 60, "step": 1,
+                    "tooltip": "用于减小动画 WebP 体积。1=不抽帧；2=每2帧保留1帧；3=每3帧保留1帧。被跳过帧的时长会累加到保留帧，尽量保持总播放时间不变。",
+                }),
+                "WebP质量": ("INT", {"default": 82, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "有损模式的压缩质量。动画 GIF 转 WebP 时 75~85 通常能明显降低文件大小。"}),
                 "无损": ("BOOLEAN", {"default": False, "label_on": "开启无损", "label_off": "关闭无损"}),
                 "元数据来源": (["图片内置元数据", "当前工作流元数据", "不保存元数据"], {
                     "default": "图片内置元数据",
@@ -1261,22 +1319,44 @@ class SaveCoverInnerWebPWithSourceWorkflow:
     RETURN_NAMES = ("图像", "WEBP文件路径")
     FUNCTION = "save_webp"
     CATEGORY = "图像/保存"
-    DESCRIPTION = "把表图与里图合并为单个动画 WebP；支持表图占位、连续表图帧、质量/无损设置，以及按选择写入图片内置元数据或当前 ComfyUI 工作流元数据。"
+    DESCRIPTION = "把表图与里图合并为单个动画 WebP；单图里图只播放一轮并停在里图，避免来回闪烁；多帧里图使用最大有限循环次数，并支持 GIF 原始速率、倍速和抽帧。"
 
-    def save_webp(self, 里图, 表图连续帧数=2, 表图占位颜色="#FFFFFF", WebP质量=90, 无损=False,
+    def save_webp(self, 里图, 表图连续帧数=2, 表图占位颜色="#FFFFFF", 继承GIF原始帧时长=True,
+                  播放速度倍率=1.0, 动画抽帧步长=1, WebP质量=82, 无损=False,
                   元数据来源="图片内置元数据", 文件名前缀="ComfyUI_cover_inner_webp", 自定义输出目录="", 里图文件名缓存="", 表图=None,
-                  prompt=None, extra_pnginfo=None):
+                  prompt=None, extra_pnginfo=None, **kwargs):
+        自定义帧时长 = int(kwargs.get("自定义帧时长(ms)", 100) or 100)
         self.output_dir = _normalize_output_directory(自定义输出目录, folder_paths.get_output_directory())
         inner_frames = _tensor_to_pil_frames(里图)
         cover_frames = _tensor_to_pil_frames(表图) if 表图 is not None else []
         cover_image = cover_frames[0] if cover_frames else None
 
-        frames, durations, (width, height) = _prepare_cover_inner_webp_frames(
+        # IMAGE batch 本身不携带动画时间轴；如果直接连接 GIF Load Image，
+        # 就从源文件读取每帧 duration，否则使用自定义帧时长。
+        media_info = _read_source_media_info(里图文件名缓存)
+        inner_durations = _resolve_inner_frame_durations(
+            frame_count=len(inner_frames),
+            media_info=media_info,
+            inherit_gif_timing=bool(继承GIF原始帧时长),
+            custom_frame_duration_ms=自定义帧时长,
+            playback_speed=播放速度倍率,
+        )
+        inner_frames, inner_durations = _subsample_animation_frames(
+            inner_frames, inner_durations, 动画抽帧步长
+        )
+
+        frames, _default_durations, (width, height) = _prepare_cover_inner_webp_frames(
             cover_image=cover_image,
             inner_frames=inner_frames,
             cover_frame_count=表图连续帧数,
             placeholder_color=表图占位颜色,
         )
+        # 恢复原 Qt 工具的核心帧时序：表图帧极短，里图紧随其后。
+        # 单图里图只播放 1 轮并停在最终里图，避免表图/里图持续来回闪烁。
+        # 多帧里图使用最大有限循环次数 65535，而不是 loop=0 无限循环。
+        cover_count = max(1, int(表图连续帧数))
+        durations = ([1] * cover_count) + inner_durations
+        output_loop_count = 1 if len(inner_frames) <= 1 else 65535
 
         filename_prefix = 文件名前缀 + self.prefix_append
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
@@ -1292,6 +1372,14 @@ class SaveCoverInnerWebPWithSourceWorkflow:
             prompt=prompt,
             extra_pnginfo=extra_pnginfo,
         )
+        marker["hbe_inner_effective_durations_ms"] = [int(v) for v in inner_durations]
+        marker["hbe_playback_speed_multiplier"] = float(播放速度倍率)
+        marker["hbe_frame_sample_step"] = int(动画抽帧步长)
+        marker["hbe_inherit_gif_timing"] = bool(继承GIF原始帧时长)
+        marker["hbe_cover_mode"] = "first_frame_poster"
+        marker["hbe_animation_loop"] = 0
+        # marker 变更后重新生成 native extra，确保 WebP 内记录的是实际写出的帧结构。
+        native_prompt, native_extra_pnginfo = _metadata_to_native_prompt_and_extra(selected_metadata, marker=marker)
         native_exif = _build_native_comfy_webp_exif(
             frames[0],
             prompt=native_prompt,
@@ -1308,6 +1396,7 @@ class SaveCoverInnerWebPWithSourceWorkflow:
             quality=WebP质量,
             lossless=无损,
             extra_save_kwargs=extra_save_kwargs,
+            loop_count=output_loop_count,
         )
 
         # 使用与 ComfyUI frontend getWebpMetadata() 同规则的原始 RIFF/EXIF 解析器自检。
