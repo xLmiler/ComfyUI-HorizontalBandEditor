@@ -1,4 +1,4 @@
-__version__ = "1.7.1"
+__version__ = "1.16.0"
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 

@@ -82,11 +82,120 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
+function normalizeHexColor(value, fallback = "#FFFFFF") {
+    const text = String(value ?? "").trim();
+    const full = text.match(/^#?([0-9a-fA-F]{6})$/);
+    if (full) return `#${full[1].toUpperCase()}`;
+    const short = text.match(/^#?([0-9a-fA-F]{3})$/);
+    if (short) {
+        const s = short[1].toUpperCase();
+        return `#${s[0]}${s[0]}${s[1]}${s[1]}${s[2]}${s[2]}`;
+    }
+    if (fallback && String(fallback).trim() !== String(value ?? "").trim()) {
+        return normalizeHexColor(fallback, "#FFFFFF");
+    }
+    return "#FFFFFF";
+}
 
-function getConnectedLoadImage(node) {
+function moveWidgetAfter(node, widget, afterWidget) {
+    try {
+        const list = node?.widgets;
+        if (!Array.isArray(list) || !widget || !afterWidget || widget === afterWidget) return;
+        const from = list.indexOf(widget);
+        const after = list.indexOf(afterWidget);
+        if (from < 0 || after < 0) return;
+        list.splice(from, 1);
+        const target = list.indexOf(afterWidget);
+        list.splice(target + 1, 0, widget);
+    } catch (_) {}
+}
+
+function createColorPickerWidget(node, sourceWidget, label, fallback = "#FFFFFF") {
+    if (!node || !sourceWidget) return null;
+    if (sourceWidget._hbeColorWidget) return sourceWidget._hbeColorWidget;
+
+    const root = document.createElement("div");
+    root.style.width = "100%";
+    root.style.boxSizing = "border-box";
+    root.style.display = "flex";
+    root.style.alignItems = "center";
+    root.style.gap = "8px";
+    root.style.padding = "2px 0";
+
+    const caption = document.createElement("div");
+    caption.textContent = label;
+    caption.style.flex = "0 0 86px";
+    caption.style.fontSize = "12px";
+    caption.style.opacity = "0.9";
+    caption.style.whiteSpace = "nowrap";
+
+    const colorInput = document.createElement("input");
+    colorInput.type = "color";
+    colorInput.style.flex = "0 0 42px";
+    colorInput.style.width = "42px";
+    colorInput.style.height = "28px";
+    colorInput.style.padding = "0";
+    colorInput.style.border = "1px solid rgba(255,255,255,0.12)";
+    colorInput.style.borderRadius = "6px";
+    colorInput.style.background = "transparent";
+    colorInput.style.cursor = "pointer";
+
+    const textInput = document.createElement("input");
+    textInput.type = "text";
+    textInput.placeholder = "#FFFFFF";
+    textInput.style.flex = "1 1 auto";
+    textInput.style.minWidth = "0";
+    textInput.style.height = "28px";
+    textInput.style.boxSizing = "border-box";
+    textInput.style.padding = "4px 8px";
+    textInput.style.borderRadius = "6px";
+    textInput.style.border = "1px solid rgba(255,255,255,0.12)";
+    textInput.style.background = "var(--comfy-input-bg, rgba(0,0,0,0.28))";
+    textInput.style.color = "var(--input-text, inherit)";
+
+    root.append(caption, colorInput, textInput);
+
+    const syncFromValue = (value, commit = false) => {
+        const normalized = normalizeHexColor(value, fallback);
+        if (colorInput.value !== normalized) colorInput.value = normalized;
+        if (textInput.value !== normalized) textInput.value = normalized;
+        if (commit && sourceWidget.value !== normalized) setWidgetValue(sourceWidget, normalized, node);
+    };
+
+    colorInput.addEventListener("input", () => syncFromValue(colorInput.value, true));
+    textInput.addEventListener("change", () => syncFromValue(textInput.value, true));
+    textInput.addEventListener("blur", () => syncFromValue(textInput.value, true));
+    textInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            syncFromValue(textInput.value, true);
+            textInput.blur();
+        }
+    });
+
+    chainWidgetCallback(sourceWidget, () => syncFromValue(sourceWidget.value, false));
+
+    const widget = node.addDOMWidget(label, `hbe_color_${label}`, root, {
+        serialize: false,
+        hideOnZoom: false,
+        getMinHeight: () => 34,
+        getMaxHeight: () => 34,
+        getHeight: () => 34,
+    });
+    widget.serialize = false;
+    sourceWidget._hbeColorWidget = widget;
+    widget._hbeSourceWidget = sourceWidget;
+
+    moveWidgetAfter(node, widget, sourceWidget);
+    setWidgetHidden(sourceWidget, true);
+    syncFromValue(sourceWidget.value, false);
+    return widget;
+}
+
+
+function getConnectedLoadImageByInputNames(node, inputNames) {
     if (!node?.inputs?.length || !app.graph) return null;
     for (const input of node.inputs) {
-        if (!input || !["输入图像", "input_image"].includes(input.name) || input.link == null) continue;
+        if (!input || !inputNames.includes(input.name) || input.link == null) continue;
         const link = app.graph.links?.[input.link];
         const upstream = link?.origin_id != null ? app.graph.getNodeById?.(link.origin_id) : null;
         if (!upstream) continue;
@@ -101,6 +210,10 @@ function getConnectedLoadImage(node) {
         }
     }
     return null;
+}
+
+function getConnectedLoadImage(node) {
+    return getConnectedLoadImageByInputNames(node, ["输入图像", "input_image"]);
 }
 
 function makeViewUrl(filename) {
@@ -118,7 +231,11 @@ function installNativeVisibility(node) {
     const bgModeW = getWidget(node, "面板背景", "panel_background");
     const bgColorW = getWidget(node, "背景颜色", "background_color");
     const textContentW = getWidget(node, "文字内容", "text");
+    const textColorW = getWidget(node, "文字颜色", "text_color");
     const sourceFileCacheW = getWidget(node, "源图文件名缓存", "source_image_filename_cache");
+
+    const bgColorPickerW = createColorPickerWidget(node, bgColorW, "背景颜色", "#FFFFFF");
+    const textColorPickerW = createColorPickerWidget(node, textColorW, "文字颜色", "#000000");
 
     // multiline STRING 本身也是 growable DOM widget。若不限制高度，开启文字面板后
     // 它会和编辑预览共同瓜分节点拉伸出来的 freeWidgetSpace。
@@ -127,9 +244,9 @@ function installNativeVisibility(node) {
 
     const textWidgets = [
         bgModeW,
-        bgColorW,
+        bgColorPickerW,
         textContentW,
-        getWidget(node, "文字颜色", "text_color"),
+        textColorPickerW,
         getWidget(node, "字体名称或路径", "font_name_or_path"),
         getWidget(node, "字号", "font_size"),
         getWidget(node, "内边距", "padding"),
@@ -169,7 +286,7 @@ function installNativeVisibility(node) {
         const textEnabled = Boolean(enableTextW?.value);
         for (const widget of textWidgets) setWidgetHidden(widget, !textEnabled);
         if (textEnabled && String(bgModeW?.value || "纯色") === "透明") {
-            setWidgetHidden(bgColorW, true);
+            setWidgetHidden(bgColorPickerW, true);
         }
 
         // 技术缓存字段始终隐藏，由前端自动维护。
@@ -555,21 +672,141 @@ function addPreviewWidget(node) {
     });
 }
 
+
+
+function _hbeReadUint16(view, offset, littleEndian) {
+    if (offset < 0 || offset + 2 > view.byteLength) throw new Error("EXIF uint16 越界");
+    return view.getUint16(offset, littleEndian);
+}
+
+function _hbeReadUint32(view, offset, littleEndian) {
+    if (offset < 0 || offset + 4 > view.byteLength) throw new Error("EXIF uint32 越界");
+    return view.getUint32(offset, littleEndian);
+}
+
+function _hbeParseExifKeyValue(exifBytes) {
+    const result = {};
+    let bytes = exifBytes;
+    if (bytes.length >= 6 && String.fromCharCode(...bytes.slice(0, 6)) === "Exif\0\0") {
+        bytes = bytes.slice(6);
+    }
+    if (bytes.length < 8) return result;
+
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const order = String.fromCharCode(bytes[0], bytes[1]);
+    const little = order === "II";
+    if (!little && order !== "MM") return result;
+
+    const ifdOffset = _hbeReadUint32(view, 4, little);
+    if (ifdOffset + 2 > bytes.length) return result;
+    const count = _hbeReadUint16(view, ifdOffset, little);
+    const decoder = new TextDecoder("utf-8");
+
+    for (let i = 0; i < count; i++) {
+        const entry = ifdOffset + 2 + i * 12;
+        if (entry + 12 > bytes.length) break;
+        const type = _hbeReadUint16(view, entry + 2, little);
+        const numValues = _hbeReadUint32(view, entry + 4, little);
+        if (type !== 2 || numValues <= 1) continue;
+
+        let raw;
+        if (numValues <= 4) {
+            raw = bytes.slice(entry + 8, entry + 8 + numValues - 1);
+        } else {
+            const valueOffset = _hbeReadUint32(view, entry + 8, little);
+            if (valueOffset + numValues - 1 > bytes.length) continue;
+            raw = bytes.slice(valueOffset, valueOffset + numValues - 1);
+        }
+        const value = decoder.decode(raw);
+        const colon = value.indexOf(":");
+        if (colon <= 0) continue;
+        result[value.slice(0, colon)] = value.slice(colon + 1);
+    }
+    return result;
+}
+
+async function _hbeReadWebpMetadata(file) {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length < 12) return {};
+    if (String.fromCharCode(...bytes.slice(0, 4)) !== "RIFF" || String.fromCharCode(...bytes.slice(8, 12)) !== "WEBP") {
+        return {};
+    }
+
+    const view = new DataView(buffer);
+    let offset = 12;
+    while (offset + 8 <= bytes.length) {
+        const chunkType = String.fromCharCode(...bytes.slice(offset, offset + 4));
+        const chunkLength = view.getUint32(offset + 4, true);
+        const dataStart = offset + 8;
+        const dataEnd = dataStart + chunkLength;
+        if (dataEnd > bytes.length) break;
+        if (chunkType === "EXIF") {
+            return _hbeParseExifKeyValue(bytes.slice(dataStart, dataEnd));
+        }
+        // RIFF/WebP 规范要求奇数长度 chunk 额外补 1 byte。
+        offset = dataEnd + (chunkLength % 2);
+    }
+    return {};
+}
+
+function installWebpWorkflowDropCompatibility() {
+    if (app._hbeWebpHandleFilePatched || typeof app.handleFile !== "function") return;
+    app._hbeWebpHandleFilePatched = true;
+    const originalHandleFile = app.handleFile;
+
+    app.handleFile = async function (file, openSource, options) {
+        const name = String(file?.name || "");
+        const isWebp = file?.type === "image/webp" || name.toLowerCase().endsWith(".webp");
+        if (isWebp) {
+            try {
+                const metadata = await _hbeReadWebpMetadata(file);
+                const workflowText = metadata.workflow || metadata.Workflow;
+                if (workflowText) {
+                    const workflow = typeof workflowText === "string" ? JSON.parse(workflowText) : workflowText;
+                    const fileName = name.replace(/\.\w+$/, "");
+                    // 只在原生 WebP workflow 读取失败风险最大的场景介入。
+                    // loadGraphData 是 ComfyUI 自己用于恢复完整 workflow 的入口。
+                    await this.loadGraphData(workflow, true, true, fileName, { openSource });
+                    return;
+                }
+            } catch (error) {
+                console.warn("[ComfyUI-HorizontalBandEditor] WebP workflow 兼容读取失败，回退 ComfyUI 原生处理：", error);
+            }
+        }
+        return originalHandleFile.call(this, file, openSource, options);
+    };
+}
+
 app.registerExtension({
     name: "HorizontalBandEditor.NativeUI",
 
+    async setup() {
+        // 当前某些 ComfyUI frontend 版本对 WebP workflow 拖入仍存在兼容问题。
+        // 这里只补 WebP 文件读取，不影响 PNG/JSON/普通图片的原生处理。
+        installWebpWorkflowDropCompatibility();
+    },
+
     async nodeCreated(node) {
-        if (node?.comfyClass !== NODE_NAME && node?.type !== NODE_NAME) return;
+        const comfyClass = node?.comfyClass || node?.type;
+        if (comfyClass !== NODE_NAME && comfyClass !== COVER_WEBP_NODE_NAME) return;
         if (node._hbeInstalled) return;
         node._hbeInstalled = true;
 
-        installNativeVisibility(node);
-        addPreviewWidget(node);
+        if (comfyClass === NODE_NAME) {
+            installNativeVisibility(node);
+            addPreviewWidget(node);
+        } else if (comfyClass === COVER_WEBP_NODE_NAME) {
+            installCoverInnerWebPNode(node);
+        }
 
         const originalConnectionsChange = node.onConnectionsChange;
         node.onConnectionsChange = function (...args) {
             const result = originalConnectionsChange?.apply(this, args);
-            requestAnimationFrame(() => this._hbeEnsurePreviewSource?.(true));
+            requestAnimationFrame(() => {
+                this._hbeEnsurePreviewSource?.(true);
+                this._hbeCoverInnerRefresh?.();
+            });
             return result;
         };
 
@@ -579,6 +816,7 @@ app.registerExtension({
             requestAnimationFrame(() => {
                 this._hbeRefreshVisibility?.();
                 this._hbeEnsurePreviewSource?.(true);
+                this._hbeCoverInnerRefresh?.();
                 this._hbeDrawPreview?.();
             });
             return result;
@@ -587,7 +825,10 @@ app.registerExtension({
         const originalResize = node.onResize;
         node.onResize = function (...args) {
             const result = originalResize?.apply(this, args);
-            requestAnimationFrame(() => this._hbeDrawPreview?.());
+            requestAnimationFrame(() => {
+                this._hbeDrawPreview?.();
+                this._hbeCoverInnerRefresh?.();
+            });
             return result;
         };
 
@@ -598,13 +839,46 @@ app.registerExtension({
         };
 
         requestAnimationFrame(() => {
-            const width = Math.max(Number(node.size?.[0] || PREVIEW_DEFAULT_WIDTH), PREVIEW_DEFAULT_WIDTH);
-            const height = Number(node.size?.[1] || 0);
-            if (node.size && node.size[0] < width) {
-                node.setSize?.([width, height]);
+            if (comfyClass === NODE_NAME) {
+                const width = Math.max(Number(node.size?.[0] || PREVIEW_DEFAULT_WIDTH), PREVIEW_DEFAULT_WIDTH);
+                const height = Number(node.size?.[1] || 0);
+                if (node.size && node.size[0] < width) {
+                    node.setSize?.([width, height]);
+                }
             }
             node._hbeEnsurePreviewSource?.(true);
+            node._hbeCoverInnerRefresh?.();
             node._hbeDrawPreview?.();
         });
     },
 });
+
+
+const COVER_WEBP_NODE_NAME = "SaveCoverInnerWebPWithSourceWorkflow";
+
+function installCoverInnerWebPNode(node) {
+    const placeholderColorW = getWidget(node, "表图占位颜色", "表图占位颜色");
+    const placeholderColorPickerW = createColorPickerWidget(node, placeholderColorW, "表图占位颜色", "#FFFFFF");
+    const innerSourceFileW = getWidget(node, "里图文件名缓存", "inner_source_image_filename_cache");
+
+    function refresh() {
+        setWidgetHidden(innerSourceFileW, true);
+        setWidgetHidden(placeholderColorW, true);
+        setWidgetHidden(placeholderColorPickerW, false);
+
+        const innerConnected = getConnectedLoadImageByInputNames(node, ["里图", "inner_image"]);
+        if (innerSourceFileW) {
+            const nextValue = innerConnected?.filename || "";
+            if (innerSourceFileW.value !== nextValue) setWidgetValue(innerSourceFileW, nextValue, node);
+        }
+
+        refreshWidgetLayout(node);
+        requestAnimationFrame(() => {
+            try { node.arrange?.(); } catch (_) {}
+            node.graph?.setDirtyCanvas?.(true, true);
+        });
+    }
+
+    node._hbeCoverInnerRefresh = refresh;
+    refresh();
+}

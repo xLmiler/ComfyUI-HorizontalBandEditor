@@ -1,12 +1,25 @@
 import json
 import os
+import struct
+from types import SimpleNamespace
 from typing import List, Tuple
+from xml.etree import ElementTree as ET
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps, ImageSequence, PngImagePlugin
 
 import folder_paths
+
+try:
+    from comfy.cli_args import args as comfy_cli_args
+except Exception:
+    comfy_cli_args = None
+
+try:
+    from comfy_api.latest._ui import ImageSaveHelper as ComfyNativeImageSaveHelper
+except Exception:
+    ComfyNativeImageSaveHelper = None
 
 MAX_RESOLUTION = 16384
 REGION_LABELS = tuple("ABCDEFGHIJKL")
@@ -207,6 +220,37 @@ def _tensor_to_pil(input_image: torch.Tensor, input_alpha_mask=None) -> Image.Im
     return Image.fromarray(np.dstack([rgb, alpha]), mode="RGBA")
 
 
+
+def _pil_frames_to_image_batch(frames: List[Image.Image]) -> torch.Tensor:
+    if not frames:
+        raise ValueError("没有可输出的图像帧。")
+    tensors = []
+    for frame in frames:
+        rgba = np.asarray(frame.convert("RGBA"), dtype=np.float32) / 255.0
+        tensors.append(torch.from_numpy(rgba[..., :3].copy()))
+    return torch.stack(tensors, dim=0)
+
+
+def _normalize_output_directory(custom_output_dir: str, default_output_dir: str) -> str:
+    raw = str(custom_output_dir or "").strip().strip('\"').strip("'")
+    if not raw:
+        return default_output_dir
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+
+    # 兼容 Windows 绝对路径与 UNC 路径。
+    is_windows_abs = False
+    if len(expanded) >= 3 and expanded[1] == ':' and expanded[2] in ('\\', '/') and expanded[0].isalpha():
+        is_windows_abs = True
+    if expanded.startswith('\\\\'):
+        is_windows_abs = True
+
+    if os.path.isabs(expanded) or is_windows_abs:
+        return os.path.normpath(expanded)
+
+    # 兼容用户手写的 Windows 相对路径分隔符，例如 subdir\nested。
+    expanded = expanded.replace('\\', os.sep)
+    return os.path.normpath(os.path.join(default_output_dir, expanded))
 def _collect_regions(kwargs, height):
     count = int(_kw(kwargs, ("截面数量", "region_count"), 1))
     count = max(1, min(len(REGION_LABELS), count))
@@ -235,6 +279,345 @@ def _collect_regions(kwargs, height):
     return merged
 
 
+
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def _list_available_input_images():
+    """与 ComfyUI 原生 LoadImage 一致：只枚举 input 根目录，避免递归扫描导致节点定义/工作流切换变慢。"""
+    input_dir = folder_paths.get_input_directory()
+    if not os.path.isdir(input_dir):
+        return [""]
+    files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+    try:
+        files = folder_paths.filter_files_content_types(files, ["image"])
+    except Exception:
+        files = [f for f in files if os.path.splitext(f)[1].lower() in SUPPORTED_IMAGE_EXTS]
+    return sorted(files) or [""]
+
+def _list_available_webp_images():
+    """只列出 input 根目录中的 WebP，避免扫描子目录造成节点创建和工作流切换变慢。"""
+    input_dir = folder_paths.get_input_directory()
+    if not os.path.isdir(input_dir):
+        return [""]
+    files = [
+        f for f in os.listdir(input_dir)
+        if os.path.isfile(os.path.join(input_dir, f)) and os.path.splitext(f)[1].lower() == ".webp"
+    ]
+    return sorted(files) or [""]
+
+
+def _resolve_any_image_path(path_or_name: str):
+    raw = str(path_or_name or "").strip().strip('"').strip("'")
+    if not raw:
+        return None
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+
+    candidates = []
+    try:
+        if folder_paths.exists_annotated_filepath(expanded):
+            resolved = folder_paths.get_annotated_filepath(expanded)
+            if resolved:
+                candidates.append(resolved)
+    except Exception:
+        pass
+
+    candidates.append(expanded)
+    candidates.append(os.path.join(folder_paths.get_input_directory(), expanded))
+    try:
+        candidates.append(os.path.join(folder_paths.get_output_directory(), expanded))
+    except Exception:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.exists(normalized):
+            return normalized
+    return None
+
+
+def _load_image_tensors_with_comfy_native(image_name: str):
+    """优先直接复用 ComfyUI 原生 LoadImage，避免本插件重复解码动画并复制整批 Tensor。"""
+    try:
+        import nodes as comfy_core_nodes
+        loader_cls = getattr(comfy_core_nodes, "LoadImage", None)
+        if loader_cls is not None:
+            return loader_cls().load_image(image_name)
+    except Exception:
+        pass
+
+    # 仅用于非常旧或特殊环境的兼容回退。
+    resolved, frames, _ = _load_image_frames_from_path(image_name)
+    return _pil_frames_to_image_mask_batch(frames)
+
+
+def _path_to_ui_image_descriptor(path: str):
+    if not path:
+        return None
+    path = os.path.normpath(path)
+    locations = []
+    try:
+        locations.append((os.path.normpath(folder_paths.get_input_directory()), "input"))
+    except Exception:
+        pass
+    try:
+        locations.append((os.path.normpath(folder_paths.get_output_directory()), "output"))
+    except Exception:
+        pass
+    try:
+        temp_dir = folder_paths.get_temp_directory()
+        locations.append((os.path.normpath(temp_dir), "temp"))
+    except Exception:
+        pass
+
+    for base, kind in locations:
+        try:
+            rel = os.path.relpath(path, base)
+        except Exception:
+            continue
+        if rel.startswith(".."):
+            continue
+        subfolder = os.path.dirname(rel).replace("\\", "/")
+        return {
+            "filename": os.path.basename(path),
+            "subfolder": "" if subfolder == "." else subfolder,
+            "type": kind,
+        }
+    return None
+
+
+def _pil_frames_to_image_mask_batch(frames: List[Image.Image]):
+    if not frames:
+        raise ValueError("没有可输出的图像帧。")
+    image_tensors = []
+    mask_tensors = []
+    for frame in frames:
+        rgba = np.asarray(frame.convert("RGBA"), dtype=np.float32) / 255.0
+        image_tensors.append(torch.from_numpy(rgba[..., :3].copy()))
+        mask_tensors.append(torch.from_numpy((1.0 - rgba[..., 3]).copy()))
+    return torch.stack(image_tensors, dim=0), torch.stack(mask_tensors, dim=0)
+
+
+def _make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(v) for v in value]
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8", errors="ignore")
+        except Exception:
+            return repr(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _parse_json_text(value, fallback=None):
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8", errors="ignore")
+        except Exception:
+            return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    try:
+        return json.loads(text)
+    except Exception:
+        return fallback
+
+
+def _coerce_metadata_value(value):
+    if isinstance(value, (dict, list, int, float, bool)) or value is None:
+        return _make_json_safe(value)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="ignore")
+    text = str(value)
+    stripped = text.strip()
+    if (stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]")):
+        parsed = _parse_json_text(stripped, None)
+        if parsed is not None:
+            return _make_json_safe(parsed)
+    return text
+
+
+def _store_metadata_value(target: dict, key: str, value):
+    if value is None:
+        return
+    target[str(key)] = _coerce_metadata_value(value)
+
+
+def _metadata_to_strings(metadata: dict):
+    metadata = _make_json_safe(metadata or {})
+    prompt = metadata.get("prompt", "")
+    workflow = metadata.get("workflow", "")
+
+    def value_to_text(value):
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return str(value)
+
+    try:
+        all_json = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        all_json = "{}"
+    return value_to_text(prompt), value_to_text(workflow), all_json
+
+
+def _split_comfy_exif_text(value):
+    """解析 ComfyUI 原生 WebP EXIF 中的 `key:<json>` ASCII 文本。"""
+    if not isinstance(value, str) or ":" not in value:
+        return None, None
+    key, payload = value.split(":", 1)
+    key = key.strip()
+    if not key:
+        return None, None
+    parsed = _parse_json_text(payload, None)
+    return key, parsed if parsed is not None else payload
+
+
+def _extract_metadata_from_open_image(img: Image.Image, path: str):
+    """
+    读取图片文件里实际保存的元数据。
+
+    目标是与 ComfyUI 原生保存节点的数据语义一致：
+    - PNG: prompt + EXTRA_PNGINFO 各 key 的 PNG text chunk
+    - WebP: EXIF ASCII `key:<json>`，与原生 Save Animated WEBP 相同
+    - GIF: Comment Extension 中的 JSON（ComfyUI 原生目前没有对应 GIF workflow saver，
+      这里作为插件扩展兼容）
+    """
+    ext = os.path.splitext(path or "")[1].lower()
+    fmt = str(getattr(img, "format", "") or "").upper()
+    info = dict(getattr(img, "info", {}) or {})
+    metadata = {}
+
+    if ext == ".gif" or fmt == "GIF":
+        comment = info.get("comment")
+        parsed_comment = _parse_json_text(comment, None)
+        if isinstance(parsed_comment, dict):
+            for key, value in parsed_comment.items():
+                _store_metadata_value(metadata, key, value)
+        elif comment:
+            _store_metadata_value(metadata, "comment", comment)
+        for key in ("loop", "background", "transparency"):
+            if key in info:
+                _store_metadata_value(metadata, key, info[key])
+        return metadata
+
+    if ext == ".webp" or fmt == "WEBP":
+        try:
+            exif = img.getexif()
+            for _, value in exif.items():
+                key, parsed = _split_comfy_exif_text(value)
+                if key:
+                    _store_metadata_value(metadata, key, parsed)
+        except Exception:
+            pass
+        return metadata
+
+    # PNG 以及其他静态图片：Pillow 会把 PNG 文本块放在 info 中。
+    # ComfyUI 原生 SaveImage 保存的是 prompt 与 EXTRA_PNGINFO 每个 key 的 json.dumps(value)。
+    for key, value in info.items():
+        if key in {"exif", "xmp", "icc_profile"}:
+            continue
+        _store_metadata_value(metadata, key, value)
+    return metadata
+
+
+def _read_source_media_info(path_or_name: str):
+    resolved = _resolve_any_image_path(path_or_name)
+    result = {
+        "resolved": resolved,
+        "ext": os.path.splitext(resolved or str(path_or_name or ""))[1].lower(),
+        "is_gif": False,
+        "gif_durations_ms": [],
+        "gif_loop": 0,
+    }
+    if not resolved:
+        return result
+
+    try:
+        with Image.open(resolved) as img:
+            ext = os.path.splitext(resolved)[1].lower()
+            is_gif = ext == ".gif" or getattr(img, "format", "") == "GIF"
+            result["is_gif"] = bool(is_gif)
+            if is_gif:
+                result["gif_loop"] = int(img.info.get("loop", 0) or 0)
+                durations = []
+                frame_count = int(getattr(img, "n_frames", 1) or 1)
+                for i in range(frame_count):
+                    try:
+                        img.seek(i)
+                    except EOFError:
+                        break
+                    duration = int(img.info.get("duration", 0) or 0)
+                    durations.append(duration if duration > 0 else 100)
+                result["gif_durations_ms"] = durations
+    except Exception:
+        pass
+    return result
+
+
+def _extract_metadata_from_image(path: str):
+    resolved = _resolve_any_image_path(path)
+    if not resolved:
+        return {}
+    try:
+        with Image.open(resolved) as img:
+            return _extract_metadata_from_open_image(img, resolved)
+    except Exception:
+        return {}
+
+
+def _load_image_frames_from_path(path: str):
+    resolved = _resolve_any_image_path(path)
+    if not resolved:
+        raise FileNotFoundError(f"找不到图片文件：{path}")
+
+    frames = []
+    with Image.open(resolved) as img:
+        metadata = _extract_metadata_from_open_image(img, resolved)
+        ext = os.path.splitext(resolved)[1].lower()
+        is_gif = ext == ".gif" or getattr(img, "format", "") == "GIF"
+        gif_durations = []
+        gif_loop = int(img.info.get("loop", 0) or 0) if is_gif else 0
+
+        frame_count = int(getattr(img, "n_frames", 1) or 1)
+        for i in range(frame_count):
+            try:
+                img.seek(i)
+            except EOFError:
+                break
+            frame = img.convert("RGBA")
+            frame.load()
+            frames.append(frame.copy())
+            if is_gif:
+                duration = int(img.info.get("duration", 0) or 0)
+                gif_durations.append(duration if duration > 0 else 100)
+
+        if is_gif:
+            metadata["_gif_durations_ms"] = gif_durations
+            metadata["_gif_loop"] = gif_loop
+
+    if not frames:
+        raise RuntimeError("未能从图片中读取到任何帧。")
+    return resolved, frames, metadata
+
+
 def _resolve_input_image_path(source_image_filename: str):
     if not source_image_filename:
         return None
@@ -248,27 +631,447 @@ def _resolve_input_image_path(source_image_filename: str):
 
 
 def _extract_source_workflow_metadata(source_image_filename: str):
-    path = _resolve_input_image_path(source_image_filename)
+    path = _resolve_input_image_path(source_image_filename) or _resolve_any_image_path(source_image_filename)
     if not path:
         return {}
+    return _extract_metadata_from_image(path)
+
+
+def _tensor_to_pil_frames(image_tensor) -> List[Image.Image]:
+    if image_tensor is None:
+        return []
+    if not isinstance(image_tensor, torch.Tensor):
+        image_tensor = torch.as_tensor(image_tensor)
+    tensor = image_tensor.detach().cpu().float()
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 4:
+        raise ValueError(f"输入图像维度不正确：{tuple(image_tensor.shape)}")
+
+    frames: List[Image.Image] = []
+    for frame in tensor:
+        frame = frame.clamp(0.0, 1.0)
+        arr = (frame.numpy() * 255.0).round().astype(np.uint8)
+        if arr.shape[-1] < 3:
+            raise ValueError("输入图像至少需要 RGB 三个通道。")
+        if arr.shape[-1] >= 4:
+            rgba = arr[..., :4]
+            if rgba.shape[-1] == 4:
+                img = Image.fromarray(rgba, mode="RGBA")
+            else:
+                img = Image.fromarray(rgba[..., :3], mode="RGB").convert("RGBA")
+        else:
+            alpha = np.full(arr.shape[:2] + (1,), 255, dtype=np.uint8)
+            img = Image.fromarray(np.concatenate([arr[..., :3], alpha], axis=-1), mode="RGBA")
+        frames.append(img)
+    return frames
+
+
+def _fit_to_canvas(img: Image.Image, size: Tuple[int, int]) -> Image.Image:
+    rgba = img.convert("RGBA")
+    if rgba.size == size:
+        return rgba.copy()
+    fitted = ImageOps.contain(rgba, size, method=Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    x = (size[0] - fitted.width) // 2
+    y = (size[1] - fitted.height) // 2
+    canvas.alpha_composite(fitted, (x, y))
+    return canvas
+
+
+def _crop_to_canvas(img: Image.Image, size: Tuple[int, int]) -> Image.Image:
+    rgba = img.convert("RGBA")
+    if rgba.size == size:
+        return rgba.copy()
+    return ImageOps.fit(
+        rgba,
+        size,
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+
+
+def _make_distinct_duplicate_frame(img: Image.Image, step: int = 1) -> Image.Image:
+    dup = img.convert("RGBA").copy()
+    x = max(0, dup.width - 1)
+    y = max(0, dup.height - 1)
+    r, g, b, a = dup.getpixel((x, y))
+    if a > 0:
+        dup.putpixel((x, y), (r, g, b, max(0, a - min(step, 254))))
+    else:
+        dup.putpixel((x, y), ((r + step) % 256, g, b, 0))
+    return dup
+
+
+def _prepare_cover_inner_webp_frames(
+    cover_image: Image.Image | None,
+    inner_frames: List[Image.Image],
+    cover_frame_count: int,
+    placeholder_color: str,
+):
+    if not inner_frames:
+        raise ValueError("里图不能为空，至少需要连接 1 帧图像。")
+
+    target_size = inner_frames[0].size
+    if cover_image is None:
+        rgba = _parse_hex_color(placeholder_color, (255, 255, 255, 255))
+        cover = Image.new("RGBA", target_size, rgba)
+    else:
+        cover = _crop_to_canvas(cover_image, target_size)
+
+    frames: List[Image.Image] = []
+    cover_frame_count = max(1, int(cover_frame_count))
+    for i in range(cover_frame_count):
+        frames.append(cover.copy() if i == 0 else _make_distinct_duplicate_frame(cover, i))
+
+    normalized_inner: List[Image.Image] = []
+    for frame in inner_frames:
+        if frame.size == target_size:
+            normalized_inner.append(frame.convert("RGBA"))
+        else:
+            normalized_inner.append(_fit_to_canvas(frame, target_size))
+
+    frames.extend(normalized_inner)
+
+    durations = [1] * cover_frame_count
+    if len(normalized_inner) == 1:
+        durations.append(600_000)
+    else:
+        durations.extend([100] * len(normalized_inner))
+
+    return frames, durations, target_size
+
+
+def _native_json_dumps(value):
+    """与 ComfyUI 原生 SaveImage / SaveAnimatedWEBP 一样直接 json.dumps。"""
+    return json.dumps(_make_json_safe(value))
+
+
+def _clean_metadata_for_embedding(metadata: dict):
+    metadata = _make_json_safe(metadata or {})
+    cleaned = {}
+    for key, value in metadata.items():
+        key = str(key)
+        if key == "hbe" or key.startswith("hbe_"):
+            continue
+        if key in {"_gif_durations_ms", "_gif_loop"}:
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def _current_workflow_metadata(prompt=None, extra_pnginfo=None):
+    """构造与 ComfyUI 原生保存节点 hidden PROMPT / EXTRA_PNGINFO 相同的数据集合。"""
+    metadata = {}
+    if prompt is not None:
+        metadata["prompt"] = _make_json_safe(prompt)
+    if isinstance(extra_pnginfo, dict):
+        for key, value in extra_pnginfo.items():
+            metadata[str(key)] = _make_json_safe(value)
+    return metadata
+
+
+def _metadata_to_native_prompt_and_extra(metadata: dict, marker: dict | None = None):
+    """
+    将“图片内置元数据”转换为 ComfyUI 原生保存节点的数据模型：
+    prompt 单独保存，其余所有 key 都视为 EXTRA_PNGINFO。
+    """
+    metadata = _clean_metadata_for_embedding(metadata)
+    prompt = metadata.get("prompt", None)
+    extra = {k: v for k, v in metadata.items() if k != "prompt"}
+    if marker is not None:
+        extra["hbe"] = _make_json_safe(marker)
+    return prompt, extra
+
+
+def _build_native_comfy_webp_exif(pil_image: Image.Image, prompt=None, extra_pnginfo=None):
+    """
+    优先直接调用当前 ComfyUI 自带 ImageSaveHelper._create_webp_metadata。
+    这样 prompt / EXTRA_PNGINFO 的 EXIF tag 与序列化行为和原生 Save Animated WEBP 完全一致。
+    仅在旧版 ComfyUI 不存在该 helper 时使用兼容回退。
+    """
+    if ComfyNativeImageSaveHelper is not None:
+        try:
+            carrier = SimpleNamespace(hidden=SimpleNamespace(prompt=prompt, extra_pnginfo=extra_pnginfo))
+            return ComfyNativeImageSaveHelper._create_webp_metadata(pil_image, carrier)
+        except Exception:
+            pass
+
+    exif_data = pil_image.getexif()
+    if comfy_cli_args is not None and bool(getattr(comfy_cli_args, "disable_metadata", False)):
+        return exif_data
+    if prompt is not None:
+        exif_data[0x0110] = "prompt:{}".format(_native_json_dumps(prompt))
+    if extra_pnginfo is not None:
+        initial_exif_tag = 0x010F
+        for key, value in extra_pnginfo.items():
+            exif_data[initial_exif_tag] = "{}:{}".format(key, _native_json_dumps(value))
+            initial_exif_tag -= 1
+    return exif_data
+
+
+def _build_native_pnginfo_from_metadata(metadata: dict):
+    """优先复用 ComfyUI 原生 PNG metadata helper；旧版环境再回退到等价实现。"""
+    if comfy_cli_args is not None and bool(getattr(comfy_cli_args, "disable_metadata", False)):
+        return None
+    metadata = _clean_metadata_for_embedding(metadata)
+    prompt = metadata.get("prompt", None)
+    extras = {k: v for k, v in metadata.items() if k != "prompt"}
+
+    if ComfyNativeImageSaveHelper is not None:
+        try:
+            carrier = SimpleNamespace(hidden=SimpleNamespace(prompt=prompt, extra_pnginfo=extras))
+            return ComfyNativeImageSaveHelper._create_png_metadata(carrier)
+        except Exception:
+            pass
+
+    pnginfo = PngImagePlugin.PngInfo()
+    if prompt is not None:
+        pnginfo.add_text("prompt", _native_json_dumps(prompt))
+    for key, value in extras.items():
+        pnginfo.add_text(str(key), _native_json_dumps(value))
+    return pnginfo
+
+
+def _build_webp_metadata_payload(metadata_source: str, source_image_filename: str,
+                                 cover_frame_count: int, inner_frame_count: int,
+                                 prompt=None, extra_pnginfo=None):
+    media_info = _read_source_media_info(source_image_filename)
+    source_ext = media_info.get("ext") or ".png"
+    is_gif = bool(media_info.get("is_gif"))
+
+    if metadata_source == "当前工作流元数据":
+        selected_metadata = _current_workflow_metadata(prompt, extra_pnginfo)
+        source_key = "current_workflow"
+    elif metadata_source == "不保存元数据":
+        selected_metadata = {}
+        source_key = "none"
+    else:
+        selected_metadata = _extract_metadata_from_image(source_image_filename) if source_image_filename else {}
+        source_key = "image_embedded"
+
+    selected_metadata = _clean_metadata_for_embedding(selected_metadata)
+
+    marker = {
+        "hbe_cover_inner_webp": True,
+        "hbe_marker_version": 3,
+        "hbe_inner_start_index": int(max(0, cover_frame_count)),
+        "hbe_inner_start_frame": int(max(1, cover_frame_count + 1)),
+        "hbe_inner_frame_count": int(max(0, inner_frame_count)),
+        "hbe_inner_media_type": "gif" if is_gif else "image",
+        "hbe_inner_source_ext": source_ext or (".gif" if is_gif else ".png"),
+        "hbe_inner_source_is_gif": bool(is_gif),
+        "hbe_metadata_source": source_key,
+    }
+    if is_gif:
+        marker["hbe_inner_gif_durations_ms"] = media_info.get("gif_durations_ms", [])
+        marker["hbe_inner_gif_loop"] = int(media_info.get("gif_loop", 0) or 0)
+
+    native_prompt, native_extra = _metadata_to_native_prompt_and_extra(selected_metadata, marker=marker)
+    return selected_metadata, marker, native_prompt, native_extra
+
+
+def _read_comfy_webp_metadata_native_compatible(path: str):
+    """
+    按 ComfyUI frontend 当前 getWebpMetadata() 的实际规则读取 WebP EXIF：
+    - 遍历 RIFF chunk
+    - 找到 EXIF
+    - 解析第一层 TIFF IFD
+    - 只读取 type=2 (ASCII)
+    - 每条字符串按第一个 ':' 拆成 key/value
+
+    这个函数用于保存后自检，确保生成的 WebP 真的能被 ComfyUI 前端识别，
+    而不是只保证 Pillow 自己能读回来。
+    """
+    result = {}
     try:
-        with Image.open(path) as img:
-            info = dict(getattr(img, "info", {}) or {})
+        with open(path, "rb") as f:
+            webp = f.read()
+        if len(webp) < 12 or webp[0:4] != b"RIFF" or webp[8:12] != b"WEBP":
+            return result
+
+        offset = 12
+        exif_data = None
+        while offset + 8 <= len(webp):
+            chunk_type = webp[offset:offset + 4]
+            chunk_length = struct.unpack_from("<I", webp, offset + 4)[0]
+            data_start = offset + 8
+            data_end = data_start + chunk_length
+            if data_end > len(webp):
+                break
+            if chunk_type == b"EXIF":
+                exif_data = webp[data_start:data_end]
+                break
+            offset = data_end + (chunk_length % 2)
+
+        if not exif_data:
+            return result
+        if exif_data.startswith(b"Exif\x00\x00"):
+            exif_data = exif_data[6:]
+        if len(exif_data) < 8:
+            return result
+
+        byte_order = exif_data[0:2]
+        if byte_order == b"II":
+            endian = "<"
+        elif byte_order == b"MM":
+            endian = ">"
+        else:
+            return result
+
+        def u16(pos):
+            if pos < 0 or pos + 2 > len(exif_data):
+                raise ValueError("EXIF u16 越界")
+            return struct.unpack_from(endian + "H", exif_data, pos)[0]
+
+        def u32(pos):
+            if pos < 0 or pos + 4 > len(exif_data):
+                raise ValueError("EXIF u32 越界")
+            return struct.unpack_from(endian + "I", exif_data, pos)[0]
+
+        ifd_offset = u32(4)
+        entry_count = u16(ifd_offset)
+        for i in range(entry_count):
+            entry_offset = ifd_offset + 2 + i * 12
+            if entry_offset + 12 > len(exif_data):
+                break
+            value_type = u16(entry_offset + 2)
+            num_values = u32(entry_offset + 4)
+            value_offset = u32(entry_offset + 8)
+            if value_type != 2 or num_values <= 1:
+                continue
+            # 与 ComfyUI frontend 当前实现保持一致：ASCII 数据通过 valueOffset 读取。
+            if value_offset < 0 or value_offset + num_values - 1 > len(exif_data):
+                continue
+            raw = exif_data[value_offset:value_offset + num_values - 1]
+            try:
+                value = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                value = raw.decode("utf-8", errors="ignore")
+            index = value.find(":")
+            if index <= 0:
+                continue
+            result[value[:index]] = value[index + 1:]
     except Exception:
         return {}
+    return result
 
-    metadata = {}
-    for key, value in info.items():
-        if value is None:
-            continue
-        if isinstance(value, (str, int, float, bool)):
-            metadata[str(key)] = str(value) if not isinstance(value, str) else value
-        elif isinstance(value, (dict, list, tuple)):
-            try:
-                metadata[str(key)] = json.dumps(value, ensure_ascii=False)
-            except Exception:
-                pass
-    return metadata
+
+def _verify_comfy_webp_drag_metadata(path: str):
+    """
+    仅做非阻断诊断：按 ComfyUI 前端规则读取保存后的 WebP 元数据。
+    不再因为 Python 侧对象比较差异而让图片保存失败。
+    """
+    return _read_comfy_webp_metadata_native_compatible(path)
+
+
+def _extract_cover_inner_info(metadata: dict):
+    metadata = metadata or {}
+    marker = metadata.get("hbe", {})
+    if isinstance(marker, str):
+        marker = _parse_json_text(marker, {}) or {}
+    if not isinstance(marker, dict):
+        marker = {}
+
+    # Backward compatibility: old versions stored hbe_* keys at the root.
+    for key, value in metadata.items():
+        if str(key).startswith("hbe_") and key not in marker:
+            marker[key] = value
+
+    has_marker = bool(marker.get("hbe_cover_inner_webp", False)) or ("hbe_inner_start_index" in marker) or ("hbe_inner_start_frame" in marker)
+    try:
+        start_index = int(marker.get("hbe_inner_start_index", max(0, int(marker.get("hbe_inner_start_frame", 1)) - 1)))
+    except Exception:
+        start_index = 0
+    try:
+        start_frame = int(marker.get("hbe_inner_start_frame", start_index + 1))
+    except Exception:
+        start_frame = start_index + 1
+    try:
+        inner_frame_count = int(marker.get("hbe_inner_frame_count", 0))
+    except Exception:
+        inner_frame_count = 0
+
+    media_type = str(marker.get("hbe_inner_media_type", "gif" if marker.get("hbe_inner_source_is_gif") else "image") or "image")
+    source_ext = str(marker.get("hbe_inner_source_ext", ".gif" if media_type == "gif" else ".png") or ".png")
+
+    # v1.10 compatibility: old payload duplicated source metadata inside marker.
+    old_inner_meta = marker.get("hbe_inner_metadata", metadata.get("hbe_inner_metadata", {}))
+    if isinstance(old_inner_meta, str):
+        old_inner_meta = _parse_json_text(old_inner_meta, {}) or {}
+
+    if isinstance(old_inner_meta, dict) and old_inner_meta:
+        inner_meta = _make_json_safe(old_inner_meta)
+    else:
+        # New format: prompt/workflow/extras live at WEBP root; marker only describes frame layout.
+        inner_meta = {}
+        for key, value in metadata.items():
+            key = str(key)
+            if key == "hbe" or key.startswith("hbe_"):
+                continue
+            inner_meta[key] = _make_json_safe(value)
+
+    if media_type == "gif":
+        durations = marker.get("hbe_inner_gif_durations_ms", [])
+        if isinstance(durations, list):
+            inner_meta["_gif_durations_ms"] = [int(v) for v in durations if isinstance(v, (int, float)) or str(v).isdigit()]
+        try:
+            inner_meta["_gif_loop"] = int(marker.get("hbe_inner_gif_loop", 0) or 0)
+        except Exception:
+            inner_meta["_gif_loop"] = 0
+
+    return {
+        "has_marker": has_marker,
+        "start_index": max(0, start_index),
+        "start_frame": max(1, start_frame),
+        "inner_frame_count": max(0, inner_frame_count),
+        "media_type": media_type,
+        "source_ext": source_ext,
+        "metadata_source": str(marker.get("hbe_metadata_source", "unknown")),
+        "inner_metadata": inner_meta,
+        "marker": marker,
+    }
+
+
+def _save_frames_as_webp(frames: List[Image.Image], durations: List[int], out_path: str,
+                         quality: int, lossless: bool, extra_save_kwargs=None):
+    if len(frames) < 2:
+        raise RuntimeError("至少需要 2 帧才能保存为动画 WebP。")
+    if len(frames) != len(durations):
+        raise RuntimeError(f"帧数与时长数量不一致：{len(frames)} / {len(durations)}")
+
+    base_size = frames[0].size
+    normalized = []
+    for idx, frame in enumerate(frames):
+        rgba = frame.convert("RGBA")
+        if rgba.size != base_size:
+            raise RuntimeError(f"第 {idx + 1} 帧尺寸不一致：{rgba.size}，预期 {base_size}")
+        if normalized and ImageChops.difference(normalized[-1], rgba).getbbox() is None:
+            rgba = _make_distinct_duplicate_frame(rgba, (idx % 253) + 1)
+        normalized.append(rgba)
+
+    save_kwargs = {
+        "format": "WEBP",
+        "save_all": True,
+        "append_images": normalized[1:],
+        "duration": durations,
+        "loop": 1,
+        "lossless": bool(lossless),
+        "method": 6,
+        "exact": True,
+    }
+    if not lossless:
+        save_kwargs["quality"] = int(quality)
+    if extra_save_kwargs:
+        save_kwargs.update(extra_save_kwargs)
+
+    normalized[0].save(out_path, **save_kwargs)
+
+    with Image.open(out_path) as check:
+        frame_count = getattr(check, "n_frames", 1)
+        is_animated = bool(getattr(check, "is_animated", False))
+        if frame_count != len(frames) or not is_animated:
+            raise RuntimeError(f"生成的 WebP 帧数异常：期望 {len(frames)} 帧，实际 {frame_count} 帧")
 
 
 class HorizontalBandEditor:
@@ -408,70 +1211,189 @@ class HorizontalBandEditor:
         return rgb, mask, rgba, out.width, out.height, source_image_filename, inherit_source_workflow
 
 
-class SaveEditedImageWithSourceWorkflow:
+class SaveCoverInnerWebPWithSourceWorkflow:
     OUTPUT_NODE = True
 
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.type = "output"
         self.prefix_append = ""
-        self.compress_level = 4
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "图像": ("IMAGE",),
-                "源图文件名": ("STRING", {"forceInput": True}),
-                "继承源图工作流": ("BOOLEAN", {"default": True}),
-                "文件名前缀": ("STRING", {"default": "ComfyUI_edited"}),
+                "里图": ("IMAGE", {"tooltip": "里图支持单图，也支持由其他节点输出的多帧 IMAGE 批次。"}),
+                "表图连续帧数": ("INT", {
+                    "default": 2, "min": 1, "max": 240, "step": 1,
+                    "tooltip": "最终 WebP 开头连续多少帧使用表图。设为 1 表示只有第 1 帧为表图；设为 2 表示第 1、2 帧都为表图，里图从第 3 帧开始。",
+                }),
+                "表图占位颜色": ("STRING", {
+                    "default": "#FFFFFF", "multiline": False,
+                    "tooltip": "当表图输入未连接时，自动使用该纯色作为表图占位。",
+                }),
+                "WebP质量": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
+                "无损": ("BOOLEAN", {"default": False, "label_on": "开启无损", "label_off": "关闭无损"}),
+                "元数据来源": (["图片内置元数据", "当前工作流元数据", "不保存元数据"], {
+                    "default": "图片内置元数据",
+                    "tooltip": "图片内置元数据：读取里图源文件本身的 PNG 文本 / GIF Comment / WebP EXIF；当前工作流元数据：使用 ComfyUI 当前执行工作流的 prompt 与 workflow。",
+                }),
+                "文件名前缀": ("STRING", {"default": "ComfyUI_cover_inner_webp"}),
+                "自定义输出目录": ("STRING", {
+                    "default": "", "multiline": False,
+                    "tooltip": "留空时保存到 ComfyUI 默认输出目录。支持相对路径、Windows 盘符路径与 UNC 路径。",
+                }),
+                "里图文件名缓存": ("STRING", {
+                    "default": "", "multiline": False,
+                    "tooltip": "由前端自动写入，不需要手动编辑。",
+                }),
+            },
+            "optional": {
+                "表图": ("IMAGE",),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("图像", "WEBP文件路径")
+    FUNCTION = "save_webp"
+    CATEGORY = "图像/保存"
+    DESCRIPTION = "把表图与里图合并为单个动画 WebP；支持表图占位、连续表图帧、质量/无损设置，以及按选择写入图片内置元数据或当前 ComfyUI 工作流元数据。"
+
+    def save_webp(self, 里图, 表图连续帧数=2, 表图占位颜色="#FFFFFF", WebP质量=90, 无损=False,
+                  元数据来源="图片内置元数据", 文件名前缀="ComfyUI_cover_inner_webp", 自定义输出目录="", 里图文件名缓存="", 表图=None,
+                  prompt=None, extra_pnginfo=None):
+        self.output_dir = _normalize_output_directory(自定义输出目录, folder_paths.get_output_directory())
+        inner_frames = _tensor_to_pil_frames(里图)
+        cover_frames = _tensor_to_pil_frames(表图) if 表图 is not None else []
+        cover_image = cover_frames[0] if cover_frames else None
+
+        frames, durations, (width, height) = _prepare_cover_inner_webp_frames(
+            cover_image=cover_image,
+            inner_frames=inner_frames,
+            cover_frame_count=表图连续帧数,
+            placeholder_color=表图占位颜色,
+        )
+
+        filename_prefix = 文件名前缀 + self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir, width, height
+        )
+        os.makedirs(full_output_folder, exist_ok=True)
+
+        selected_metadata, marker, native_prompt, native_extra_pnginfo = _build_webp_metadata_payload(
+            metadata_source=元数据来源,
+            source_image_filename=里图文件名缓存,
+            cover_frame_count=表图连续帧数,
+            inner_frame_count=len(inner_frames),
+            prompt=prompt,
+            extra_pnginfo=extra_pnginfo,
+        )
+        native_exif = _build_native_comfy_webp_exif(
+            frames[0],
+            prompt=native_prompt,
+            extra_pnginfo=native_extra_pnginfo,
+        )
+        extra_save_kwargs = {"exif": native_exif}
+
+        file = f"{filename}_{counter:05}_.webp"
+        out_path = os.path.join(full_output_folder, file)
+        _save_frames_as_webp(
+            frames=frames,
+            durations=durations,
+            out_path=out_path,
+            quality=WebP质量,
+            lossless=无损,
+            extra_save_kwargs=extra_save_kwargs,
+        )
+
+        # 使用与 ComfyUI frontend getWebpMetadata() 同规则的原始 RIFF/EXIF 解析器自检。
+        # 只有这样才能确认“Pillow 能读取”与“ComfyUI 拖入画布能读取”是同一件事。
+        native_metadata = _verify_comfy_webp_drag_metadata(out_path)
+
+        ui_result = {
+            "filename": file,
+            "subfolder": subfolder,
+            "type": self.type,
+        }
+        ui_result["metadata_source"] = 元数据来源
+        ui_result["inner_start_frame"] = int(marker.get("hbe_inner_start_frame", 表图连续帧数 + 1))
+        ui_result["comfyui_webp_metadata_keys"] = sorted(native_metadata.keys())
+        ui_result["drag_workflow_ready"] = bool(native_metadata.get("workflow"))
+        if selected_metadata:
+            ui_result["source_metadata_keys"] = sorted(selected_metadata.keys())
+
+        return {
+            "ui": {"images": [ui_result]},
+            "result": (_pil_frames_to_image_batch(frames), out_path),
+        }
+
+
+class ReadWebPInnerImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "WebP文件": (_list_available_webp_images(), {
+                    "image_upload": True,
+                    "tooltip": "选择或上传由“表里图合并编辑器”生成的 WebP。节点只输出其中标记的里图帧。",
+                }),
             }
         }
 
-    RETURN_TYPES = ()
-    FUNCTION = "save_images"
-    CATEGORY = "图像/保存"
-    DESCRIPTION = "将编辑后的图像保存为 PNG；可选继承源输入图像里的工作流/提示词元数据。"
+    CATEGORY = "图像/加载"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("里图",)
+    FUNCTION = "load_inner_image"
+    DESCRIPTION = "读取由本插件生成的表里图 WebP，根据内嵌 HBE 标记自动截取里图帧。多帧里图会直接作为 IMAGE 图片组输出，因此 GIF/动画里图可以继续以批次形式处理。"
 
-    def save_images(self, 图像, 源图文件名, 继承源图工作流=True, 文件名前缀="ComfyUI_edited"):
-        images = 图像
-        filename_prefix = 文件名前缀 + self.prefix_append
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
-            filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0]
-        )
+    @classmethod
+    def IS_CHANGED(cls, WebP文件):
+        path = _resolve_any_image_path(WebP文件)
+        if not path or not os.path.exists(path):
+            return float("nan")
+        return os.path.getmtime(path)
 
-        inherited_metadata = _extract_source_workflow_metadata(源图文件名) if 继承源图工作流 else {}
-        results = []
-        for batch_number, image in enumerate(images):
-            i = 255.0 * image.cpu().numpy()
-            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+    def load_inner_image(self, WebP文件):
+        resolved = _resolve_any_image_path(WebP文件)
+        if not resolved:
+            raise FileNotFoundError(f"找不到 WebP 文件：{WebP文件}")
+        if os.path.splitext(resolved)[1].lower() != ".webp":
+            raise ValueError("“读取WebP里图”节点只接受 .webp 文件。")
 
-            pnginfo = None
-            if inherited_metadata:
-                pnginfo = PngImagePlugin.PngInfo()
-                for key, value in inherited_metadata.items():
-                    try:
-                        pnginfo.add_text(str(key), str(value))
-                    except Exception:
-                        pass
+        # 只读取一次元数据，再使用 ComfyUI 原生 LoadImage 解码像素/动画帧。
+        metadata = _extract_metadata_from_image(resolved)
+        info = _extract_cover_inner_info(metadata)
+        if not info.get("has_marker"):
+            raise ValueError("该 WebP 不包含本插件的表里图标记，无法确定里图从哪一帧开始。")
 
-            file = f"{filename}_{counter:05}_.png"
-            img.save(os.path.join(full_output_folder, file), pnginfo=pnginfo, compress_level=self.compress_level)
-            results.append({
-                "filename": file,
-                "subfolder": subfolder,
-                "type": self.type,
-            })
-            counter += 1
+        images, _masks = _load_image_tensors_with_comfy_native(WebP文件)
+        frame_count = int(images.shape[0]) if hasattr(images, "shape") and len(images.shape) > 0 else 1
 
-        return {"ui": {"images": results}}
+        start_index = max(0, min(int(info.get("start_index", 0)), frame_count))
+        declared_count = int(info.get("inner_frame_count", 0) or 0)
+        end_index = frame_count if declared_count <= 0 else min(frame_count, start_index + declared_count)
+
+        if start_index >= end_index:
+            raise ValueError(
+                f"WebP 中记录的里图范围无效：起始索引 {start_index}，总帧数 {frame_count}。"
+            )
+
+        # Tensor 切片是 view，不额外复制整批像素；多帧会直接作为 ComfyUI IMAGE 图片组输出。
+        inner_images = images[start_index:end_index]
+        return (inner_images,)
 
 
 NODE_CLASS_MAPPINGS = {
     "HorizontalBandEditor": HorizontalBandEditor,
-    "SaveEditedImageWithSourceWorkflow": SaveEditedImageWithSourceWorkflow,
+    "SaveCoverInnerWebPWithSourceWorkflow": SaveCoverInnerWebPWithSourceWorkflow,
+    "ReadWebPInnerImage": ReadWebPInnerImage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "HorizontalBandEditor": "横向截断 / 文字面板编辑器",
-    "SaveEditedImageWithSourceWorkflow": "保存编辑图像（继承源图工作流）",
+    "HorizontalBandEditor": "横向截断面板编辑器",
+    "SaveCoverInnerWebPWithSourceWorkflow": "表里图合并编辑器",
+    "ReadWebPInnerImage": "读取WebP里图",
 }
