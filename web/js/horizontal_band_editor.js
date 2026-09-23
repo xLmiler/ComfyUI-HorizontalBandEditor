@@ -97,22 +97,18 @@ function normalizeHexColor(value, fallback = "#FFFFFF") {
     return "#FFFFFF";
 }
 
-function moveWidgetAfter(node, widget, afterWidget) {
-    try {
-        const list = node?.widgets;
-        if (!Array.isArray(list) || !widget || !afterWidget || widget === afterWidget) return;
-        const from = list.indexOf(widget);
-        const after = list.indexOf(afterWidget);
-        if (from < 0 || after < 0) return;
-        list.splice(from, 1);
-        const target = list.indexOf(afterWidget);
-        list.splice(target + 1, 0, widget);
-    } catch (_) {}
-}
+function replaceWidgetWithColorPicker(node, sourceWidget, label, fallback = "#FFFFFF") {
+    if (!node || !sourceWidget || !Array.isArray(node.widgets)) return sourceWidget || null;
+    if (sourceWidget._hbeColorReplacement) return sourceWidget._hbeColorReplacement;
 
-function createColorPickerWidget(node, sourceWidget, label, fallback = "#FFFFFF") {
-    if (!node || !sourceWidget) return null;
-    if (sourceWidget._hbeColorWidget) return sourceWidget._hbeColorWidget;
+    const widgets = node.widgets;
+    const sourceIndex = widgets.indexOf(sourceWidget);
+    if (sourceIndex < 0) return sourceWidget;
+
+    const sourceName = sourceWidget.name || label;
+    const originalCallback = sourceWidget.callback;
+    const originalOptions = sourceWidget.options ? { ...sourceWidget.options } : {};
+    const initialValue = normalizeHexColor(sourceWidget.value, fallback);
 
     const root = document.createElement("div");
     root.style.width = "100%";
@@ -155,40 +151,119 @@ function createColorPickerWidget(node, sourceWidget, label, fallback = "#FFFFFF"
 
     root.append(caption, colorInput, textInput);
 
-    const syncFromValue = (value, commit = false) => {
-        const normalized = normalizeHexColor(value, fallback);
-        if (colorInput.value !== normalized) colorInput.value = normalized;
-        if (textInput.value !== normalized) textInput.value = normalized;
-        if (commit && sourceWidget.value !== normalized) setWidgetValue(sourceWidget, normalized, node);
-    };
-
-    colorInput.addEventListener("input", () => syncFromValue(colorInput.value, true));
-    textInput.addEventListener("change", () => syncFromValue(textInput.value, true));
-    textInput.addEventListener("blur", () => syncFromValue(textInput.value, true));
-    textInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-            syncFromValue(textInput.value, true);
-            textInput.blur();
-        }
-    });
-
-    chainWidgetCallback(sourceWidget, () => syncFromValue(sourceWidget.value, false));
-
-    const widget = node.addDOMWidget(label, `hbe_color_${label}`, root, {
-        serialize: false,
+    // 先使用 ComfyUI 的 DOM widget 工厂创建控件，但随后会把它放回原 STRING widget
+    // 的“同一个序列化槽位”。不能像旧版本那样插入一个 serialize=false 的中间 widget，
+    // 否则部分 ComfyUI frontend 在保存/读取 widgets_values 时会产生索引错位。
+    const widget = node.addDOMWidget(sourceName, `hbe_color_${sourceName}`, root, {
         hideOnZoom: false,
         getMinHeight: () => 34,
         getMaxHeight: () => 34,
         getHeight: () => 34,
     });
-    widget.serialize = false;
-    sourceWidget._hbeColorWidget = widget;
-    widget._hbeSourceWidget = sourceWidget;
 
-    moveWidgetAfter(node, widget, sourceWidget);
-    setWidgetHidden(sourceWidget, true);
-    syncFromValue(sourceWidget.value, false);
+    // 工作流序列化与 API prompt 序列化都必须开启。
+    // 这个颜色控件不是“额外 UI widget”，而是直接替代后端 INPUT_TYPES 创建的 STRING widget。
+    widget.serialize = true;
+    widget.options = {
+        ...originalOptions,
+        ...(widget.options || {}),
+        serialize: true,
+    };
+    widget.name = sourceName;
+    widget.value = initialValue;
+
+    // addDOMWidget 默认追加到 node.widgets 尾部。先移除它，再把原 STRING widget 原位替换掉。
+    // 这样前后 widget 数量、序列化顺序、widgets_values 索引都与后端定义保持一致。
+    const appendedIndex = widgets.indexOf(widget);
+    if (appendedIndex >= 0) widgets.splice(appendedIndex, 1);
+    const currentSourceIndex = widgets.indexOf(sourceWidget);
+    if (currentSourceIndex >= 0) widgets.splice(currentSourceIndex, 1, widget);
+    else widgets.splice(Math.min(sourceIndex, widgets.length), 0, widget);
+
+    let syncing = false;
+    const syncControls = (value) => {
+        const normalized = normalizeHexColor(value, fallback);
+        if (colorInput.value !== normalized) colorInput.value = normalized;
+        if (textInput.value !== normalized) textInput.value = normalized;
+        return normalized;
+    };
+
+    const commit = (value) => {
+        if (syncing) return;
+        syncing = true;
+        try {
+            const normalized = syncControls(value);
+            if (widget.value !== normalized) widget.value = normalized;
+            try {
+                originalCallback?.call(widget, normalized, app.canvas, node, [0, 0], {});
+            } catch (_) {}
+            node.graph?.setDirtyCanvas?.(true, true);
+        } finally {
+            syncing = false;
+        }
+    };
+
+    colorInput.addEventListener("input", () => commit(colorInput.value));
+    textInput.addEventListener("change", () => commit(textInput.value));
+    textInput.addEventListener("blur", () => commit(textInput.value));
+    textInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            commit(textInput.value);
+            textInput.blur();
+        }
+    });
+
+    widget._hbeSyncColorControls = () => {
+        const normalized = syncControls(widget.value);
+        if (widget.value !== normalized) widget.value = normalized;
+    };
+    sourceWidget._hbeColorReplacement = widget;
+    widget._hbeOriginalWidget = sourceWidget;
+    widget._hbeSyncColorControls();
     return widget;
+}
+
+function restoreNamedWidgetValues(node, config) {
+    const named = config?.widgets_values_named;
+    if (!named || typeof named !== "object" || !Array.isArray(node?.widgets)) return false;
+
+    let restored = false;
+    for (const widget of node.widgets) {
+        if (!widget?.name || widget.serialize === false) continue;
+        if (!Object.prototype.hasOwnProperty.call(named, widget.name)) continue;
+        widget.value = named[widget.name];
+        widget._hbeSyncColorControls?.();
+        restored = true;
+    }
+    return restored;
+}
+
+function repairLegacyColorPickerWidgetValues(node, config) {
+    // v1.15-v1.20 的调色盘是一个插在原 STRING widget 后面的 serialize=false DOM widget。
+    // 在受影响的 ComfyUI frontend 中，这会把 widgets_values 写成带空洞的数组：
+    // [正常值, 颜色值, null, 后续值...]
+    // 新版本已经不再产生这种结构；这里仅用于尽可能修复旧工作流。
+    const values = config?.widgets_values;
+    if (!Array.isArray(values) || !Array.isArray(node?.widgets)) return false;
+
+    const serializable = node.widgets.filter((w) => w?.serialize !== false);
+    if (values.length <= serializable.length) return false;
+
+    const repaired = [...values];
+    let changed = false;
+    while (repaired.length > serializable.length) {
+        const holeIndex = repaired.findIndex((value, index) => value == null && index > 0);
+        if (holeIndex < 0) break;
+        repaired.splice(holeIndex, 1);
+        changed = true;
+    }
+    if (!changed || repaired.length < serializable.length) return false;
+
+    for (let i = 0; i < serializable.length; i++) {
+        serializable[i].value = repaired[i];
+        serializable[i]._hbeSyncColorControls?.();
+    }
+    return true;
 }
 
 
@@ -234,8 +309,8 @@ function installNativeVisibility(node) {
     const textColorW = getWidget(node, "文字颜色", "text_color");
     const sourceFileCacheW = getWidget(node, "源图文件名缓存", "source_image_filename_cache");
 
-    const bgColorPickerW = createColorPickerWidget(node, bgColorW, "背景颜色", "#FFFFFF");
-    const textColorPickerW = createColorPickerWidget(node, textColorW, "文字颜色", "#000000");
+    const bgColorPickerW = replaceWidgetWithColorPicker(node, bgColorW, "背景颜色", "#FFFFFF");
+    const textColorPickerW = replaceWidgetWithColorPicker(node, textColorW, "文字颜色", "#000000");
 
     // multiline STRING 本身也是 growable DOM widget。若不限制高度，开启文字面板后
     // 它会和编辑预览共同瓜分节点拉伸出来的 freeWidgetSpace。
@@ -284,6 +359,8 @@ function installNativeVisibility(node) {
         }
 
         const textEnabled = Boolean(enableTextW?.value);
+        bgColorPickerW?._hbeSyncColorControls?.();
+        textColorPickerW?._hbeSyncColorControls?.();
         for (const widget of textWidgets) setWidgetHidden(widget, !textEnabled);
         if (textEnabled && String(bgModeW?.value || "纯色") === "透明") {
             setWidgetHidden(bgColorPickerW, true);
@@ -813,7 +890,14 @@ app.registerExtension({
         const originalConfigure = node.onConfigure;
         node.onConfigure = function (...args) {
             const result = originalConfigure?.apply(this, args);
+            const config = args?.[0];
+            // 新版 ComfyUI 若保存了 widgets_values_named，优先按名字恢复，彻底绕过位置索引差异。
+            // 没有 named values 时，再尝试修复 v1.15-v1.20 旧调色盘产生的 null 空洞数组。
+            if (!restoreNamedWidgetValues(this, config)) {
+                repairLegacyColorPickerWidgetValues(this, config);
+            }
             requestAnimationFrame(() => {
+                for (const widget of this.widgets || []) widget?._hbeSyncColorControls?.();
                 this._hbeRefreshVisibility?.();
                 this._hbeEnsurePreviewSource?.(true);
                 this._hbeCoverInnerRefresh?.();
@@ -858,13 +942,13 @@ const COVER_WEBP_NODE_NAME = "SaveCoverInnerWebPWithSourceWorkflow";
 
 function installCoverInnerWebPNode(node) {
     const placeholderColorW = getWidget(node, "表图占位颜色", "表图占位颜色");
-    const placeholderColorPickerW = createColorPickerWidget(node, placeholderColorW, "表图占位颜色", "#FFFFFF");
+    const placeholderColorPickerW = replaceWidgetWithColorPicker(node, placeholderColorW, "表图占位颜色", "#FFFFFF");
     const innerSourceFileW = getWidget(node, "里图文件名缓存", "inner_source_image_filename_cache");
 
     function refresh() {
         setWidgetHidden(innerSourceFileW, true);
-        setWidgetHidden(placeholderColorW, true);
         setWidgetHidden(placeholderColorPickerW, false);
+        placeholderColorPickerW?._hbeSyncColorControls?.();
 
         const innerConnected = getConnectedLoadImageByInputNames(node, ["里图", "inner_image"]);
         if (innerSourceFileW) {

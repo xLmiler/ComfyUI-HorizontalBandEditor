@@ -97,8 +97,3 @@ ComfyUI/custom_nodes/ComfyUI-HorizontalBandEditor/
 Ctrl + F5
 ```
 
----
-
-## 文档维护规则
-
-README 始终描述项目的当前完整状态。每次功能更新都会同步修改节点说明、参数、行为和推荐工作流。
