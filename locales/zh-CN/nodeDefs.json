@@ -1,0 +1,14 @@
+{
+  "HorizontalBandEditor": {
+    "display_name": "横向截断面板编辑器"
+  },
+  "SaveCoverInnerOverlayMerged": {
+    "display_name": "表里叠图合并节点"
+  },
+  "SaveCoverInnerGifWebPFromBatch": {
+    "display_name": "表里GIF合并编辑器"
+  },
+  "ReadInnerImage": {
+    "display_name": "读取里图节点"
+  }
+}

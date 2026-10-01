@@ -2,6 +2,12 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const NODE_NAME = "HorizontalBandEditor";
+const COVER_OVERLAY_NODE_NAME = "SaveCoverInnerOverlayMerged";
+const COVER_WEBP_NODE_NAME = "SaveCoverInnerWebPWithSourceWorkflow";
+const COVER_PNG_NODE_NAME = "SaveCoverInnerPngWithSourceWorkflow";
+const COVER_GIF_WEBP_NODE_NAME = "SaveCoverInnerGifWebPFromBatch";
+const READ_INNER_NODE_NAME = "ReadInnerImage";
+const LEGACY_READ_INNER_NODE_NAME = "ReadWebPInnerImage";
 const REGION_LABELS = [..."ABCDEFGHIJKL"];
 const PREVIEW_MIN_HEIGHT = 220;
 const PREVIEW_DEFAULT_WIDTH = 360;
@@ -855,8 +861,322 @@ function installWebpWorkflowDropCompatibility() {
     };
 }
 
+function _hbeLegacyOverlayDefaults(format = "PNG") {
+    return {
+        "输出格式": format,
+        "表图占位颜色": "#FFFFFF",
+        "发送兼容最小体积(KiB)": 2304,
+        "WebP质量": 82,
+        "无损": false,
+        "元数据来源": "图片内置元数据",
+        "文件名前缀": "ComfyUI_cover_inner_overlay",
+        "自定义输出目录": "",
+        "里图文件名缓存": "",
+    };
+}
+
+function _hbeApplyNamedOverlayValues(target, named) {
+    if (!named || typeof named !== "object") return target;
+    for (const key of Object.keys(target)) {
+        if (Object.prototype.hasOwnProperty.call(named, key)) target[key] = named[key];
+    }
+    return target;
+}
+
+function _hbeOverlayValuesToArray(v) {
+    return [
+        v["输出格式"],
+        v["表图占位颜色"],
+        v["发送兼容最小体积(KiB)"],
+        v["WebP质量"],
+        v["无损"],
+        v["元数据来源"],
+        v["文件名前缀"],
+        v["自定义输出目录"],
+        v["里图文件名缓存"],
+    ];
+}
+
+function _hbeOverlayValuesToNamed(v) {
+    return {
+        "输出格式": v["输出格式"],
+        "表图占位颜色": v["表图占位颜色"],
+        "发送兼容最小体积(KiB)": v["发送兼容最小体积(KiB)"],
+        "WebP质量": v["WebP质量"],
+        "无损": v["无损"],
+        "元数据来源": v["元数据来源"],
+        "文件名前缀": v["文件名前缀"],
+        "自定义输出目录": v["自定义输出目录"],
+        "里图文件名缓存": v["里图文件名缓存"],
+    };
+}
+
+function _hbeMigrateLegacyStaticOverlayNode(node, legacyType) {
+    const values = Array.isArray(node?.widgets_values) ? node.widgets_values : [];
+    const named = node?.widgets_values_named && typeof node.widgets_values_named === "object"
+        ? node.widgets_values_named
+        : null;
+
+    let migrated;
+
+    // v1.25.3 的隐藏兼容节点已经使用统一 9 项 schema。
+    // 如果第一项明确是 PNG/WEBP，必须保留用户实际保存的格式，不能再按旧类型名覆盖。
+    if (values.length >= 9 && (values[0] === "PNG" || values[0] === "WEBP")) {
+        migrated = _hbeLegacyOverlayDefaults(values[0]);
+        migrated["表图占位颜色"] = values[1] ?? migrated["表图占位颜色"];
+        migrated["发送兼容最小体积(KiB)"] = values[2] ?? migrated["发送兼容最小体积(KiB)"];
+        migrated["WebP质量"] = values[3] ?? migrated["WebP质量"];
+        migrated["无损"] = values[4] ?? migrated["无损"];
+        migrated["元数据来源"] = values[5] ?? migrated["元数据来源"];
+        migrated["文件名前缀"] = values[6] ?? migrated["文件名前缀"];
+        migrated["自定义输出目录"] = values[7] ?? migrated["自定义输出目录"];
+        migrated["里图文件名缓存"] = values[8] ?? migrated["里图文件名缓存"];
+    } else if (legacyType === COVER_WEBP_NODE_NAME) {
+        migrated = _hbeLegacyOverlayDefaults("WEBP");
+        if (values.length >= 12) {
+            // v1.22.0 静态/动画混合节点：
+            // 0 cover_count,1 color,2 inherit,3 custom_ms,4 speed,5 sample,
+            // 6 quality,7 lossless,8 metadata,9 prefix,10 output_dir,11 source_cache
+            migrated["表图占位颜色"] = values[1] ?? migrated["表图占位颜色"];
+            migrated["WebP质量"] = values[6] ?? migrated["WebP质量"];
+            migrated["无损"] = values[7] ?? migrated["无损"];
+            migrated["元数据来源"] = values[8] ?? migrated["元数据来源"];
+            migrated["文件名前缀"] = values[9] ?? migrated["文件名前缀"];
+            migrated["自定义输出目录"] = values[10] ?? migrated["自定义输出目录"];
+            migrated["里图文件名缓存"] = values[11] ?? migrated["里图文件名缓存"];
+        } else if (values.length >= 8) {
+            // 独立静态 WebP 节点：
+            // 0 cover_count,1 color,2 quality,3 lossless,4 metadata,5 prefix,6 output_dir,7 source_cache
+            migrated["表图占位颜色"] = values[1] ?? migrated["表图占位颜色"];
+            migrated["WebP质量"] = values[2] ?? migrated["WebP质量"];
+            migrated["无损"] = values[3] ?? migrated["无损"];
+            migrated["元数据来源"] = values[4] ?? migrated["元数据来源"];
+            migrated["文件名前缀"] = values[5] ?? migrated["文件名前缀"];
+            migrated["自定义输出目录"] = values[6] ?? migrated["自定义输出目录"];
+            migrated["里图文件名缓存"] = values[7] ?? migrated["里图文件名缓存"];
+        }
+    } else {
+        migrated = _hbeLegacyOverlayDefaults("PNG");
+        if (values.length >= 7) {
+            // 独立静态 PNG/APNG 节点：
+            // 0 color,1 apng_ms,2 transport,3 metadata,4 prefix,5 output_dir,6 source_cache
+            migrated["表图占位颜色"] = values[0] ?? migrated["表图占位颜色"];
+            migrated["发送兼容最小体积(KiB)"] = values[2] ?? migrated["发送兼容最小体积(KiB)"];
+            migrated["元数据来源"] = values[3] ?? migrated["元数据来源"];
+            migrated["文件名前缀"] = values[4] ?? migrated["文件名前缀"];
+            migrated["自定义输出目录"] = values[5] ?? migrated["自定义输出目录"];
+            migrated["里图文件名缓存"] = values[6] ?? migrated["里图文件名缓存"];
+        }
+    }
+
+    migrated = _hbeApplyNamedOverlayValues(migrated, named);
+    // 历史 schema 没有“输出格式”命名字段时，由旧类型决定；有则以命名值为准。
+    if (named && (named["输出格式"] === "PNG" || named["输出格式"] === "WEBP")) {
+        migrated["输出格式"] = named["输出格式"];
+    }
+
+    node.type = COVER_OVERLAY_NODE_NAME;
+    node.widgets_values = _hbeOverlayValuesToArray(migrated);
+    node.widgets_values_named = _hbeOverlayValuesToNamed(migrated);
+
+    // 输入 socket 的位置与类型本来就一致；输出 slot 仅统一名称，不碰 links。
+    if (Array.isArray(node.outputs)) {
+        if (node.outputs[0]) node.outputs[0].name = "图像";
+        if (node.outputs[1]) node.outputs[1].name = "文件路径";
+    }
+
+    // 只改由旧节点默认产生的标题；用户自己改过的标题原样保留。
+    const legacyTitles = new Set([
+        "[Legacy] Cover-Inner WebP Merge", "[Legacy] Cover-Inner PNG Merge",
+        "Cover-Inner WebP Merge", "Cover-Inner PNG Merge",
+        "[旧版] 表里图合并编辑器", "[旧版] 表里单图PNG编辑器",
+        "表里图合并编辑器", "表里单图PNG编辑器",
+    ]);
+    if (legacyTitles.has(node.title)) delete node.title;
+
+    if (node.properties && typeof node.properties === "object") {
+        const srKey = "Node name for S&R";
+        if (node.properties[srKey] === legacyType) node.properties[srKey] = COVER_OVERLAY_NODE_NAME;
+    }
+    return true;
+}
+
+function _hbeMigrateLegacyReadNode(node) {
+    const legacyType = node.type;
+    node.type = READ_INNER_NODE_NAME;
+
+    if (node.widgets_values_named && typeof node.widgets_values_named === "object") {
+        if (Object.prototype.hasOwnProperty.call(node.widgets_values_named, "WebP文件") &&
+            !Object.prototype.hasOwnProperty.call(node.widgets_values_named, "图片文件")) {
+            node.widgets_values_named["图片文件"] = node.widgets_values_named["WebP文件"];
+        }
+        delete node.widgets_values_named["WebP文件"];
+    }
+    if (Array.isArray(node.outputs) && node.outputs[0]) node.outputs[0].name = "里图";
+
+    const legacyTitles = new Set([
+        "Read Inner From WebP", "Read WebP Inner Image", "[Alias] Read Inner Image",
+        "读取WebP里图", "[别名] 读取里图节点",
+    ]);
+    if (legacyTitles.has(node.title)) delete node.title;
+
+    if (node.properties && typeof node.properties === "object") {
+        const srKey = "Node name for S&R";
+        if (node.properties[srKey] === legacyType) node.properties[srKey] = READ_INNER_NODE_NAME;
+    }
+    return true;
+}
+
+function _hbeMigrateLegacyWorkflowTypes(workflow) {
+    if (!workflow || typeof workflow !== "object") return 0;
+    let migratedCount = 0;
+    const seen = new WeakSet();
+
+    function visit(value) {
+        if (!value || typeof value !== "object") return;
+        if (seen.has(value)) return;
+        seen.add(value);
+
+        if (!Array.isArray(value) && typeof value.type === "string") {
+            if (value.type === COVER_WEBP_NODE_NAME || value.type === COVER_PNG_NODE_NAME) {
+                if (_hbeMigrateLegacyStaticOverlayNode(value, value.type)) migratedCount += 1;
+            } else if (value.type === LEGACY_READ_INNER_NODE_NAME) {
+                if (_hbeMigrateLegacyReadNode(value)) migratedCount += 1;
+            }
+        }
+
+        if (Array.isArray(value)) {
+            for (const item of value) visit(item);
+        } else {
+            for (const child of Object.values(value)) visit(child);
+        }
+    }
+
+    visit(workflow);
+    return migratedCount;
+}
+
+
+function installLegacyWorkflowTypePreloader() {
+    if (app._hbeLegacyWorkflowTypePreloaderPatched || typeof app.loadGraphData !== "function") return;
+    app._hbeLegacyWorkflowTypePreloaderPatched = true;
+    const originalLoadGraphData = app.loadGraphData;
+
+    app.loadGraphData = async function (graphData, ...args) {
+        // 在 ComfyUI 内部 loadSubgraphs() 之前先迁移一次，确保子图定义里的旧 type
+        // 也不会被提前注册/解析成缺失节点。beforeConfigureGraph 还会再做一次幂等兜底。
+        try {
+            _hbeMigrateLegacyWorkflowTypes(graphData);
+        } catch (error) {
+            console.error("[ComfyUI-HorizontalBandEditor] 旧工作流预迁移失败：", error);
+        }
+        return originalLoadGraphData.call(this, graphData, ...args);
+    };
+}
+
+function migrateLegacyGifCoverInnerWidgets(node, config) {
+    const comfyClass = node?.comfyClass || node?.type;
+    if (comfyClass !== COVER_GIF_WEBP_NODE_NAME) return false;
+    const values = config?.widgets_values;
+    if (!Array.isArray(values)) return false;
+
+    // v1.23.2 删除 GIF 节点的 cover_count 控件并在后端固定为 2。
+    // 必须分别迁移 v1.23.0 与 v1.23.1 的位置数组，否则旧 cover_count 会继续
+    // 按位置落到“表图占位颜色”等后续控件中，造成整个节点参数错位。
+    // v1.23.5 当前格式共有 10 个 widget，但 index 2 已经是颜色字符串，
+    // 新增的“发送兼容最小体积(KiB)”被追加在最后，不会破坏 v1.23.2~1.23.4 的位置。
+    // 这里先识别当前格式，避免被误当成 v1.23.1 的旧 10 项数组。
+    if (values.length >= 10 && typeof values[2] === "string" && values[2].startsWith("#")) {
+        return false;
+    }
+
+    let mapping = null;
+    if (values.length >= 11) {
+        // v1.23.0：
+        // 0 fps, 1 loop_count, 2 sample, 3 cover_count, 4 color,
+        // 5 quality, 6 lossless, 7 metadata_source, 8 prefix, 9 output_dir, 10 source_cache.
+        mapping = [
+            ["帧率(FPS)", 0],
+            ["动画抽帧步长", 2],
+            ["表图占位颜色", 4],
+            ["WebP质量", 5],
+            ["无损", 6],
+            ["元数据来源", 7],
+            ["文件名前缀", 8],
+            ["自定义输出目录", 9],
+            ["里图文件名缓存", 10],
+        ];
+    } else if (values.length >= 10) {
+        // v1.23.1：
+        // 0 fps, 1 sample, 2 cover_count, 3 color,
+        // 4 quality, 5 lossless, 6 metadata_source, 7 prefix, 8 output_dir, 9 source_cache.
+        mapping = [
+            ["帧率(FPS)", 0],
+            ["动画抽帧步长", 1],
+            ["表图占位颜色", 3],
+            ["WebP质量", 4],
+            ["无损", 5],
+            ["元数据来源", 6],
+            ["文件名前缀", 7],
+            ["自定义输出目录", 8],
+            ["里图文件名缓存", 9],
+        ];
+    } else {
+        return false;
+    }
+
+    for (const [name, index] of mapping) {
+        const widget = getWidget(node, name, name);
+        if (widget && index < values.length) setWidgetValue(widget, values[index], node);
+    }
+    return true;
+}
+
+function migrateLegacyOverlayMergedWidgets(node, config) {
+    const comfyClass = node?.comfyClass || node?.type;
+    if (comfyClass !== COVER_OVERLAY_NODE_NAME) return false;
+    const values = config?.widgets_values;
+    if (!Array.isArray(values)) return false;
+
+    // v1.25.0 旧格式（按位置）：
+    // 0 format, 1 cover_count, 2 color, 3 apng_ms, 4 transport_kib, 5 quality,
+    // 6 lossless, 7 metadata, 8 prefix, 9 output_dir, 10 source_cache
+    // 新格式删除了 cover_count 与 apng_ms，且通过 named values 优先恢复。
+    if (!(values.length >= 11 && typeof values[1] === "number" && typeof values[2] === "string")) return false;
+
+    const mapping = [
+        ["输出格式", 0],
+        ["表图占位颜色", 2],
+        ["发送兼容最小体积(KiB)", 4],
+        ["WebP质量", 5],
+        ["无损", 6],
+        ["元数据来源", 7],
+        ["文件名前缀", 8],
+        ["自定义输出目录", 9],
+        ["里图文件名缓存", 10],
+    ];
+    for (const [name, index] of mapping) {
+        const widget = getWidget(node, name, name);
+        if (widget && index < values.length) setWidgetValue(widget, values[index], node);
+    }
+    return true;
+}
+
 app.registerExtension({
     name: "HorizontalBandEditor.NativeUI",
+
+    async init() {
+        installLegacyWorkflowTypePreloader();
+    },
+
+    async beforeConfigureGraph(graphData) {
+        // 使用 ComfyUI 官方工作流加载钩子，在缺失节点检查和 graph.configure 之前
+        // 直接把旧节点 type 与参数结构改写为当前节点。迁移后画布中不存在旧节点类型。
+        const count = _hbeMigrateLegacyWorkflowTypes(graphData);
+        if (count > 0) {
+            console.info(`[ComfyUI-HorizontalBandEditor] 已自动迁移 ${count} 个旧节点为当前节点类型。`);
+        }
+    },
 
     async setup() {
         // 当前某些 ComfyUI frontend 版本对 WebP workflow 拖入仍存在兼容问题。
@@ -866,14 +1186,16 @@ app.registerExtension({
 
     async nodeCreated(node) {
         const comfyClass = node?.comfyClass || node?.type;
-        if (comfyClass !== NODE_NAME && comfyClass !== COVER_WEBP_NODE_NAME) return;
+        if (comfyClass !== NODE_NAME && comfyClass !== COVER_OVERLAY_NODE_NAME && comfyClass !== COVER_GIF_WEBP_NODE_NAME) return;
         if (node._hbeInstalled) return;
         node._hbeInstalled = true;
 
         if (comfyClass === NODE_NAME) {
             installNativeVisibility(node);
             addPreviewWidget(node);
-        } else if (comfyClass === COVER_WEBP_NODE_NAME) {
+        } else if (comfyClass === COVER_OVERLAY_NODE_NAME) {
+            installCoverInnerOverlayNode(node);
+        } else if (comfyClass === COVER_GIF_WEBP_NODE_NAME) {
             installCoverInnerWebPNode(node);
         }
 
@@ -893,7 +1215,11 @@ app.registerExtension({
             const config = args?.[0];
             // 新版 ComfyUI 若保存了 widgets_values_named，优先按名字恢复，彻底绕过位置索引差异。
             // 没有 named values 时，再尝试修复 v1.15-v1.20 旧调色盘产生的 null 空洞数组。
-            if (!restoreNamedWidgetValues(this, config)) {
+            const restoredNamed = restoreNamedWidgetValues(this, config);
+            // 旧别名节点就算已恢复部分同名控件，也必须强制纠正“输出格式”等新控件。
+            if (!restoredNamed) {
+                migrateLegacyOverlayMergedWidgets(this, config);
+                migrateLegacyGifCoverInnerWidgets(this, config);
                 repairLegacyColorPickerWidgetValues(this, config);
             }
             requestAnimationFrame(() => {
@@ -938,7 +1264,46 @@ app.registerExtension({
 });
 
 
-const COVER_WEBP_NODE_NAME = "SaveCoverInnerWebPWithSourceWorkflow";
+
+function installCoverInnerOverlayNode(node) {
+    const formatW = getWidget(node, "输出格式", "output_format");
+    const placeholderColorW = getWidget(node, "表图占位颜色", "表图占位颜色");
+    const transportMinW = getWidget(node, "发送兼容最小体积(KiB)", "transport_min_kib");
+    const webpQualityW = getWidget(node, "WebP质量", "webp_quality");
+    const webpLosslessW = getWidget(node, "无损", "webp_lossless");
+    const innerSourceFileW = getWidget(node, "里图文件名缓存", "inner_source_image_filename_cache");
+    const placeholderColorPickerW = replaceWidgetWithColorPicker(node, placeholderColorW, "表图占位颜色", "#FFFFFF");
+
+    function refresh() {
+        const fmt = String(formatW?.value || "PNG").toUpperCase();
+        const isWebp = fmt === "WEBP";
+
+        setWidgetHidden(innerSourceFileW, true);
+        setWidgetHidden(placeholderColorPickerW, false);
+        placeholderColorPickerW?._hbeSyncColorControls?.();
+
+        setWidgetHidden(webpQualityW, !isWebp);
+        setWidgetHidden(webpLosslessW, !isWebp);
+        setWidgetHidden(transportMinW, false);
+
+        const innerConnected = getConnectedLoadImageByInputNames(node, ["里图", "inner_image"]);
+        if (innerSourceFileW) {
+            const nextValue = innerConnected?.filename || "";
+            if (innerSourceFileW.value !== nextValue) setWidgetValue(innerSourceFileW, nextValue, node);
+        }
+
+        refreshWidgetLayout(node);
+        requestAnimationFrame(() => {
+            try { node.arrange?.(); } catch (_) {}
+            node.graph?.setDirtyCanvas?.(true, true);
+        });
+    }
+
+    chainWidgetCallback(formatW, refresh);
+    node._hbeRefreshVisibility = refresh;
+    node._hbeCoverInnerRefresh = refresh;
+    refresh();
+}
 
 function installCoverInnerWebPNode(node) {
     const placeholderColorW = getWidget(node, "表图占位颜色", "表图占位颜色");
@@ -950,7 +1315,7 @@ function installCoverInnerWebPNode(node) {
         setWidgetHidden(placeholderColorPickerW, false);
         placeholderColorPickerW?._hbeSyncColorControls?.();
 
-        const innerConnected = getConnectedLoadImageByInputNames(node, ["里图", "inner_image"]);
+        const innerConnected = getConnectedLoadImageByInputNames(node, ["里图", "里图图片组", "inner_image"]);
         if (innerSourceFileW) {
             const nextValue = innerConnected?.filename || "";
             if (innerSourceFileW.value !== nextValue) setWidgetValue(innerSourceFileW, nextValue, node);

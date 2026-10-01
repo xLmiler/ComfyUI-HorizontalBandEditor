@@ -1,6 +1,7 @@
 import json
 import os
 import struct
+import zlib
 from types import SimpleNamespace
 from typing import List, Tuple
 from xml.etree import ElementTree as ET
@@ -296,13 +297,14 @@ def _list_available_input_images():
     return sorted(files) or [""]
 
 def _list_available_webp_images():
-    """只列出 input 根目录中的 WebP，避免扫描子目录造成节点创建和工作流切换变慢。"""
+    """列出 input 根目录中的 PNG / WebP，供读取里图节点使用。"""
     input_dir = folder_paths.get_input_directory()
     if not os.path.isdir(input_dir):
         return [""]
+    exts = {".webp", ".png"}
     files = [
         f for f in os.listdir(input_dir)
-        if os.path.isfile(os.path.join(input_dir, f)) and os.path.splitext(f)[1].lower() == ".webp"
+        if os.path.isfile(os.path.join(input_dir, f)) and os.path.splitext(f)[1].lower() in exts
     ]
     return sorted(files) or [""]
 
@@ -781,6 +783,29 @@ def _subsample_animation_frames(frames: List[Image.Image], durations: List[int],
     return out_frames, out_durations
 
 
+def _repeat_animation_to_minimum(frames: List[Image.Image], durations: List[int], min_frames: int):
+    """
+    对极少帧动画进行循环补帧，确保导出的动画至少达到最小帧数。
+    这样可以显著提高某些聊天软件把 WebP 识别为“可点击查看原图的动画里图”
+    而不是直接在聊天流里瞬间播放完毕的概率。
+    """
+    if not frames or not durations:
+        return list(frames), list(durations)
+    min_frames = max(1, int(min_frames or 1))
+    if len(frames) >= min_frames:
+        return list(frames), list(durations)
+
+    out_frames = []
+    out_durations = []
+    i = 0
+    while len(out_frames) < min_frames:
+        src_idx = i % len(frames)
+        out_frames.append(frames[src_idx].copy())
+        out_durations.append(int(durations[src_idx]))
+        i += 1
+    return out_frames, out_durations
+
+
 def _native_json_dumps(value):
     """与 ComfyUI 原生 SaveImage / SaveAnimatedWEBP 一样直接 json.dumps。"""
     return json.dumps(_make_json_safe(value))
@@ -872,12 +897,42 @@ def _build_native_pnginfo_from_metadata(metadata: dict):
     return pnginfo
 
 
+def _build_native_pnginfo_from_prompt_extra(prompt=None, extra_pnginfo=None):
+    """
+    直接按 ComfyUI 原生 SaveImage 的 prompt / EXTRA_PNGINFO 语义构建 PNG metadata。
+
+    与 _build_native_pnginfo_from_metadata() 不同，这里不会清理 hbe / hbe_* 字段，
+    因为 HBE marker 本身就是读取表里图所必需的结构元数据。
+    """
+    if comfy_cli_args is not None and bool(getattr(comfy_cli_args, "disable_metadata", False)):
+        return None
+
+    if ComfyNativeImageSaveHelper is not None:
+        try:
+            carrier = SimpleNamespace(hidden=SimpleNamespace(prompt=prompt, extra_pnginfo=extra_pnginfo))
+            return ComfyNativeImageSaveHelper._create_png_metadata(carrier)
+        except Exception:
+            pass
+
+    pnginfo = PngImagePlugin.PngInfo()
+    if prompt is not None:
+        pnginfo.add_text("prompt", _native_json_dumps(prompt))
+    if isinstance(extra_pnginfo, dict):
+        for key, value in extra_pnginfo.items():
+            pnginfo.add_text(str(key), _native_json_dumps(value))
+    return pnginfo
+
+
 def _build_webp_metadata_payload(metadata_source: str, source_image_filename: str,
                                  cover_frame_count: int, inner_frame_count: int,
-                                 prompt=None, extra_pnginfo=None):
+                                 prompt=None, extra_pnginfo=None,
+                                 media_type_override: str | None = None,
+                                 source_ext_override: str | None = None):
     media_info = _read_source_media_info(source_image_filename)
-    source_ext = media_info.get("ext") or ".png"
-    is_gif = bool(media_info.get("is_gif"))
+    source_ext = source_ext_override or media_info.get("ext") or ".png"
+    inferred_is_gif = bool(media_info.get("is_gif"))
+    media_type = str(media_type_override or ("gif" if inferred_is_gif else "image"))
+    is_gif = media_type == "gif"
 
     if metadata_source == "当前工作流元数据":
         selected_metadata = _current_workflow_metadata(prompt, extra_pnginfo)
@@ -897,7 +952,7 @@ def _build_webp_metadata_payload(metadata_source: str, source_image_filename: st
         "hbe_inner_start_index": int(max(0, cover_frame_count)),
         "hbe_inner_start_frame": int(max(1, cover_frame_count + 1)),
         "hbe_inner_frame_count": int(max(0, inner_frame_count)),
-        "hbe_inner_media_type": "gif" if is_gif else "image",
+        "hbe_inner_media_type": media_type,
         "hbe_inner_source_ext": source_ext or (".gif" if is_gif else ".png"),
         "hbe_inner_source_is_gif": bool(is_gif),
         "hbe_metadata_source": source_key,
@@ -1072,8 +1127,165 @@ def _extract_cover_inner_info(metadata: dict):
     }
 
 
+def _pad_webp_riff_to_min_size(path: str, min_size_bytes: int) -> int:
+    """
+    在 WebP RIFF 容器末尾追加一个未知但合法的自定义 chunk（HBEF）作为兼容填充。
+
+    WebP/RIFF 解码器应忽略未知 chunk，因此不会增加可见动画帧、不会改变 duration/loop，
+    也不需要为了凑文件体积重复执行 libwebp 编码。该填充只用于更稳定地跨过部分
+    聊天软件在“直接动画预览”和“压缩缩略图 + 查看原图”之间的文件体积判定阈值。
+
+    返回最终文件字节数。
+    """
+    min_size_bytes = max(0, int(min_size_bytes or 0))
+    if min_size_bytes <= 0:
+        return os.path.getsize(path)
+
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+
+    if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WEBP":
+        raise RuntimeError("兼容填充失败：输出文件不是有效的 RIFF/WebP 容器。")
+
+    if len(data) >= min_size_bytes:
+        return len(data)
+
+    # RIFF chunk = FourCC(4) + size(4) + payload + 可选偶数字节对齐。
+    payload_size = max(0, min_size_bytes - len(data) - 8)
+    # 使用确定性的 0 填充；若 payload 为奇数，RIFF 需要额外 1 个对齐字节。
+    chunk = bytearray(b"HBEF")
+    chunk.extend(int(payload_size).to_bytes(4, "little", signed=False))
+    chunk.extend(b"\x00" * payload_size)
+    if payload_size % 2:
+        chunk.append(0)
+
+    data.extend(chunk)
+    # RIFF size 字段不包含最前面的 'RIFF' + size 共 8 字节。
+    riff_size = len(data) - 8
+    if riff_size >= 2**32:
+        raise RuntimeError("兼容填充失败：WebP RIFF 容器超过 4 GiB。")
+    data[4:8] = int(riff_size).to_bytes(4, "little", signed=False)
+
+    with open(path, "wb") as f:
+        f.write(data)
+    return len(data)
+
+
+
+
+def _pad_png_to_min_size(path: str, min_size_bytes: int) -> int:
+    """
+    在 PNG/APNG 的 IEND 前插入一个私有的 ancillary chunk（hbEf）作为兼容填充。
+
+    这样不会改变可见像素、不会改变 APNG 帧结构，但可以把文件体积稳定推到
+    某些聊天软件更容易走“文件缩略图/点击查看原图”路径的阈值以上。
+    """
+    min_size_bytes = max(0, int(min_size_bytes or 0))
+    if min_size_bytes <= 0:
+        return os.path.getsize(path)
+
+    with open(path, 'rb') as f:
+        data = bytearray(f.read())
+
+    if len(data) < 12 or data[:8] != b'\x89PNG\r\n\x1a\n':
+        raise RuntimeError('兼容填充失败：输出文件不是有效的 PNG/APNG。')
+
+    if len(data) >= min_size_bytes:
+        return len(data)
+
+    # 查找 IEND chunk 起点。
+    pos = 8
+    iend_pos = None
+    while pos + 12 <= len(data):
+        length = int.from_bytes(data[pos:pos+4], 'big', signed=False)
+        ctype = data[pos+4:pos+8]
+        next_pos = pos + 12 + length
+        if next_pos > len(data):
+            break
+        if ctype == b'IEND':
+            iend_pos = pos
+            break
+        pos = next_pos
+
+    if iend_pos is None:
+        raise RuntimeError('兼容填充失败：找不到 IEND chunk。')
+
+    # PNG chunk = length(4, big endian) + type(4) + data + crc(4)
+    payload_size = max(0, min_size_bytes - len(data) - 12)
+    ctype = b'hbEf'
+    payload = b'\x00' * payload_size
+    crc = zlib.crc32(ctype)
+    crc = zlib.crc32(payload, crc) & 0xffffffff
+    chunk = bytearray()
+    chunk.extend(int(payload_size).to_bytes(4, 'big', signed=False))
+    chunk.extend(ctype)
+    chunk.extend(payload)
+    chunk.extend(int(crc).to_bytes(4, 'big', signed=False))
+
+    new_data = data[:iend_pos] + chunk + data[iend_pos:]
+    with open(path, 'wb') as f:
+        f.write(new_data)
+    return len(new_data)
+
+
+
+
+def _build_ui_preview_image_result(preview_image: Image.Image, preview_prefix: str = "ComfyUI_hbe_preview") -> dict:
+    """
+    始终在 ComfyUI 默认 output 目录下额外写入一个小型 PNG 预览图，
+    避免当最终文件保存到自定义外部目录时，前端 /view 无法读取造成 Nodes 2.0
+    与经典 UI 预览加载失败。
+    """
+    preview_root = folder_paths.get_output_directory()
+    width, height = preview_image.size
+    full_output_folder, filename, counter, subfolder, _prefix = folder_paths.get_save_image_path(
+        preview_prefix, preview_root, width, height
+    )
+    os.makedirs(full_output_folder, exist_ok=True)
+    file = f"{filename}_{counter:05}_.png"
+    out_path = os.path.join(full_output_folder, file)
+    preview_image.convert("RGBA").save(out_path, format="PNG", optimize=False)
+    return {
+        "filename": file,
+        "subfolder": subfolder,
+        "type": "output",
+        "preview_path": out_path,
+    }
+
+def _save_frames_as_apng(default_image: Image.Image, frames: List[Image.Image], durations: List[int], out_path: str,
+                         pnginfo=None, loop_count: int = 0):
+    if not frames:
+        raise RuntimeError('至少需要 1 帧里图才能保存为 APNG。')
+    if len(frames) != len(durations):
+        raise RuntimeError(f'APNG 帧数与时长数量不一致：{len(frames)} / {len(durations)}')
+
+    base_size = default_image.size
+    cover = default_image.convert('RGBA')
+    normalized = []
+    for idx, frame in enumerate(frames):
+        rgba = frame.convert('RGBA')
+        if rgba.size != base_size:
+            raise RuntimeError(f'APNG 第 {idx + 1} 帧尺寸不一致：{rgba.size}，预期 {base_size}')
+        if normalized and ImageChops.difference(normalized[-1], rgba).getbbox() is None:
+            rgba = _make_distinct_duplicate_frame(rgba, (idx % 253) + 1)
+        normalized.append(rgba)
+
+    save_kwargs = {
+        'format': 'PNG',
+        'save_all': True,
+        'append_images': normalized,
+        'duration': durations,
+        'loop': max(0, int(loop_count)),
+        'default_image': True,
+        'optimize': False,
+    }
+    if pnginfo is not None:
+        save_kwargs['pnginfo'] = pnginfo
+    cover.save(out_path, **save_kwargs)
+
 def _save_frames_as_webp(frames: List[Image.Image], durations: List[int], out_path: str,
-                         quality: int, lossless: bool, extra_save_kwargs=None, loop_count: int = 1):
+                         quality: int, lossless: bool, extra_save_kwargs=None, loop_count: int = 1,
+                         preserve_duplicate_frames: bool = True, verify_saved: bool = True):
     if len(frames) < 2:
         raise RuntimeError("至少需要 2 帧才能保存为动画 WebP。")
     if len(frames) != len(durations):
@@ -1085,8 +1297,14 @@ def _save_frames_as_webp(frames: List[Image.Image], durations: List[int], out_pa
         rgba = frame.convert("RGBA")
         if rgba.size != base_size:
             raise RuntimeError(f"第 {idx + 1} 帧尺寸不一致：{rgba.size}，预期 {base_size}")
-        # 不再强制修改所有重复里图帧。重复帧让 WebP 编码器自行优化，
-        # 可以显著降低 GIF/动画转 WebP 的体积。表图重复帧在前面的准备阶段已单独防合并。
+
+        # Pillow/libwebp 会合并完全相同的连续帧。
+        # 这会破坏“表图连续帧数 / 里图起始帧 / GIF 每帧 duration”的严格对应关系，
+        # 甚至让保存后的实际帧数少于 HBE marker 记录的帧数。
+        # 延续 1.x 已验证逻辑：只对完全相同的相邻帧做几乎不可见的 1 像素差异，
+        # 强制保留真实帧边界与时间轴。
+        if preserve_duplicate_frames and normalized and ImageChops.difference(normalized[-1], rgba).getbbox() is None:
+            rgba = _make_distinct_duplicate_frame(rgba, (idx % 253) + 1)
         normalized.append(rgba)
 
     save_kwargs = {
@@ -1106,11 +1324,12 @@ def _save_frames_as_webp(frames: List[Image.Image], durations: List[int], out_pa
 
     normalized[0].save(out_path, **save_kwargs)
 
-    with Image.open(out_path) as check:
-        frame_count = getattr(check, "n_frames", 1)
-        is_animated = bool(getattr(check, "is_animated", False))
-        if frame_count != len(frames) or not is_animated:
-            raise RuntimeError(f"生成的 WebP 帧数异常：期望 {len(frames)} 帧，实际 {frame_count} 帧")
+    if verify_saved:
+        with Image.open(out_path) as check:
+            frame_count = getattr(check, "n_frames", 1)
+            is_animated = bool(getattr(check, "is_animated", False))
+            if frame_count != len(frames) or not is_animated:
+                raise RuntimeError(f"生成的 WebP 帧数异常：期望 {len(frames)} 帧，实际 {frame_count} 帧")
 
 
 class HorizontalBandEditor:
@@ -1250,7 +1469,20 @@ class HorizontalBandEditor:
         return rgb, mask, rgba, out.width, out.height, source_image_filename, inherit_source_workflow
 
 
-class SaveCoverInnerWebPWithSourceWorkflow:
+class SaveCoverInnerGifWebPFromBatch:
+    """
+    GIF / 动画专用节点。
+
+    动画 WebP 专用封装策略：
+    - 固定 3 帧前缀：完整表图 + 两个极小占位帧；里图从第 4 帧开始；
+    - IMAGE Batch 作为里图动画帧；
+    - 多帧动画使用最大有限循环 65535；
+    - 不读取、也不继承源 GIF duration；统一由 FPS 构造时间轴；
+    - 极少帧动画至少补足到 30 个里图帧；
+    - 可对最终 RIFF 容器做无视觉影响的兼容填充，以更稳定触发聊天软件的缩略图/查看原图路径。
+    默认 24 FPS。
+    """
+
     OUTPUT_NODE = True
 
     def __init__(self):
@@ -1262,48 +1494,44 @@ class SaveCoverInnerWebPWithSourceWorkflow:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "里图": ("IMAGE", {"tooltip": "里图支持单图，也支持由其他节点输出的多帧 IMAGE 批次。"}),
-                "表图连续帧数": ("INT", {
-                    "default": 2, "min": 1, "max": 240, "step": 1,
-                    "tooltip": "最终 WebP 开头连续多少帧使用表图。设为 1 表示只有第 1 帧为表图；设为 2 表示第 1、2 帧都为表图，里图从第 3 帧开始。",
+                "里图图片组": ("IMAGE", {
+                    "tooltip": "连接 ComfyUI 加载出的 IMAGE Batch / 图片组。至少需要 2 帧；每一张 IMAGE 都按一帧动画处理。",
+                }),
+                "帧率(FPS)": ("FLOAT", {
+                    "default": 24.0, "min": 0.1, "max": 60.0, "step": 0.1,
+                    "tooltip": "统一动画帧率。默认 24 FPS，约每帧 41.7 ms。不读取也不继承原 GIF duration。",
+                }),
+                "动画抽帧步长": ("INT", {
+                    "default": 1, "min": 1, "max": 60, "step": 1,
+                    "tooltip": "1=不抽帧；2=每2帧保留1帧。抽帧后会自动延长保留帧时长，尽量保持原总播放速度。",
                 }),
                 "表图占位颜色": ("STRING", {
                     "default": "#FFFFFF", "multiline": False,
                     "tooltip": "当表图输入未连接时，自动使用该纯色作为表图占位。",
                 }),
-                "继承GIF原始帧时长": ("BOOLEAN", {
-                    "default": True,
-                    "label_on": "继承 GIF 原始速率",
-                    "label_off": "使用自定义帧时长",
-                    "tooltip": "当里图直接来自 GIF 时，读取 GIF 每帧 duration。关闭后统一使用自定义帧时长。",
+                "WebP质量": ("INT", {
+                    "default": 82, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "动画 WebP 有损模式的压缩质量。",
                 }),
-                "自定义帧时长(ms)": ("INT", {
-                    "default": 100, "min": 1, "max": 60000, "step": 1,
-                    "tooltip": "非 GIF、无法取得 GIF 时长、或关闭继承时使用。100ms = 10 FPS，50ms = 20 FPS。",
+                "无损": ("BOOLEAN", {
+                    "default": False, "label_on": "开启无损", "label_off": "关闭无损",
                 }),
-                "播放速度倍率": ("FLOAT", {
-                    "default": 1.0, "min": 0.05, "max": 20.0, "step": 0.05,
-                    "tooltip": "1.0=原速；2.0=2倍速；0.5=半速。对 GIF 原始时长和自定义帧时长都生效。",
-                }),
-                "动画抽帧步长": ("INT", {
-                    "default": 1, "min": 1, "max": 60, "step": 1,
-                    "tooltip": "用于减小动画 WebP 体积。1=不抽帧；2=每2帧保留1帧；3=每3帧保留1帧。被跳过帧的时长会累加到保留帧，尽量保持总播放时间不变。",
-                }),
-                "WebP质量": ("INT", {"default": 82, "min": 1, "max": 100, "step": 1,
-                    "tooltip": "有损模式的压缩质量。动画 GIF 转 WebP 时 75~85 通常能明显降低文件大小。"}),
-                "无损": ("BOOLEAN", {"default": False, "label_on": "开启无损", "label_off": "关闭无损"}),
                 "元数据来源": (["图片内置元数据", "当前工作流元数据", "不保存元数据"], {
-                    "default": "图片内置元数据",
-                    "tooltip": "图片内置元数据：读取里图源文件本身的 PNG 文本 / GIF Comment / WebP EXIF；当前工作流元数据：使用 ComfyUI 当前执行工作流的 prompt 与 workflow。",
+                    "default": "当前工作流元数据",
+                    "tooltip": "图片组本身没有 GIF 时间轴元数据。这里只决定是否写入图片/工作流元数据，不参与帧率。",
                 }),
-                "文件名前缀": ("STRING", {"default": "ComfyUI_cover_inner_webp"}),
+                "文件名前缀": ("STRING", {"default": "ComfyUI_cover_inner_gif_webp"}),
                 "自定义输出目录": ("STRING", {
                     "default": "", "multiline": False,
                     "tooltip": "留空时保存到 ComfyUI 默认输出目录。支持相对路径、Windows 盘符路径与 UNC 路径。",
                 }),
                 "里图文件名缓存": ("STRING", {
                     "default": "", "multiline": False,
-                    "tooltip": "由前端自动写入，不需要手动编辑。",
+                    "tooltip": "仅用于可选的图片内置元数据读取；不会用于读取 GIF 帧率。由前端自动写入。",
+                }),
+                "发送兼容最小体积(KiB)": ("INT", {
+                    "default": 2304, "min": 0, "max": 8192, "step": 64,
+                    "tooltip": "为了更稳定触发部分聊天软件的“缩略表图/点击查看原图”路径，最终 WebP 小于该体积时会追加播放器忽略的 RIFF 兼容填充。0=关闭。默认 2304 KiB，接近已验证正常样例的文件体积。",
                 }),
             },
             "optional": {
@@ -1317,75 +1545,342 @@ class SaveCoverInnerWebPWithSourceWorkflow:
 
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("图像", "WEBP文件路径")
-    FUNCTION = "save_webp"
+    FUNCTION = "save_animated_webp"
     CATEGORY = "图像/保存"
-    DESCRIPTION = "把表图与里图合并为单个动画 WebP；单图里图只播放一轮并停在里图，避免来回闪烁；多帧里图使用最大有限循环次数，并支持 GIF 原始速率、倍速和抽帧。"
+    DESCRIPTION = "GIF/图片组专用节点：固定使用“1 张完整表图 + 2 张极小占位帧”的 3 帧前缀，里图从第 4 帧开始；IMAGE Batch 按可调 FPS 编码，默认 24 FPS，不继承原 GIF 帧率。极少帧动画会自动补足到至少 30 个里图帧，并可使用无视觉影响的 RIFF 兼容填充稳定触发缩略图/查看原图路径。"
 
-    def save_webp(self, 里图, 表图连续帧数=2, 表图占位颜色="#FFFFFF", 继承GIF原始帧时长=True,
-                  播放速度倍率=1.0, 动画抽帧步长=1, WebP质量=82, 无损=False,
-                  元数据来源="图片内置元数据", 文件名前缀="ComfyUI_cover_inner_webp", 自定义输出目录="", 里图文件名缓存="", 表图=None,
-                  prompt=None, extra_pnginfo=None, **kwargs):
-        自定义帧时长 = int(kwargs.get("自定义帧时长(ms)", 100) or 100)
-        self.output_dir = _normalize_output_directory(自定义输出目录, folder_paths.get_output_directory())
-        inner_frames = _tensor_to_pil_frames(里图)
-        cover_frames = _tensor_to_pil_frames(表图) if 表图 is not None else []
-        cover_image = cover_frames[0] if cover_frames else None
+    def save_animated_webp(self, 里图图片组, **kwargs):
+        fps = float(kwargs.get("帧率(FPS)", 24.0) or 24.0)
+        sample_step = max(1, int(kwargs.get("动画抽帧步长", 1) or 1))
+        transport_min_kib = max(0, int(kwargs.get("发送兼容最小体积(KiB)", 2304) or 0))
+        # GIF 节点固定使用 3 帧前缀：
+        # 第 1 帧 = 完整表图；第 2、3 帧 = 极小占位差异帧；里图严格从第 4 帧开始。
+        # 该结构按用户提供的正常样例进行对齐，可显著贴近目标软件对封面/动画 WebP 的判定方式。
+        cover_count = 3
+        placeholder_color = str(kwargs.get("表图占位颜色", "#FFFFFF") or "#FFFFFF")
+        quality = int(kwargs.get("WebP质量", 82) or 82)
+        lossless = bool(kwargs.get("无损", False))
+        metadata_source = str(kwargs.get("元数据来源", "当前工作流元数据") or "当前工作流元数据")
+        filename_prefix = str(kwargs.get("文件名前缀", "ComfyUI_cover_inner_gif_webp") or "ComfyUI_cover_inner_gif_webp")
+        custom_output_dir = str(kwargs.get("自定义输出目录", "") or "")
+        source_filename = str(kwargs.get("里图文件名缓存", "") or "")
+        cover_tensor = kwargs.get("表图", None)
+        prompt = kwargs.get("prompt", None)
+        extra_pnginfo = kwargs.get("extra_pnginfo", None)
 
-        # IMAGE batch 本身不携带动画时间轴；如果直接连接 GIF Load Image，
-        # 就从源文件读取每帧 duration，否则使用自定义帧时长。
-        media_info = _read_source_media_info(里图文件名缓存)
-        inner_durations = _resolve_inner_frame_durations(
-            frame_count=len(inner_frames),
-            media_info=media_info,
-            inherit_gif_timing=bool(继承GIF原始帧时长),
-            custom_frame_duration_ms=自定义帧时长,
-            playback_speed=播放速度倍率,
-        )
+        self.output_dir = _normalize_output_directory(custom_output_dir, folder_paths.get_output_directory())
+        inner_frames = _tensor_to_pil_frames(里图图片组)
+        if len(inner_frames) < 2:
+            raise ValueError(
+                "“表里GIF合并编辑器”至少需要 2 帧 IMAGE Batch。"
+                "若只有 1 张静态里图，请使用“表里图合并编辑器”。"
+            )
+
+        # ComfyUI IMAGE Batch 只携带图像帧，不携带可靠的 GIF duration。
+        # 因此这里完全不读取源 GIF 帧率，统一由 FPS 构造时间轴。
+        fps = max(0.1, min(60.0, fps))
+        frame_duration_ms = max(1, int(round(1000.0 / fps)))
+        inner_durations = [frame_duration_ms] * len(inner_frames)
         inner_frames, inner_durations = _subsample_animation_frames(
-            inner_frames, inner_durations, 动画抽帧步长
+            inner_frames, inner_durations, sample_step
+        )
+        # 对极少帧动画做循环补足：至少 30 个里图帧。
+        # 已验证正常样例恰好为 30 个里图帧；少于该规模时，部分聊天软件更容易
+        # 走“聊天流里直接播放动画”的路径，而不是缩略表图/查看原图路径。
+        min_effective_inner_frames = max(30, int(round(fps)))
+        inner_frames, inner_durations = _repeat_animation_to_minimum(
+            inner_frames, inner_durations, min_effective_inner_frames
         )
 
-        frames, _default_durations, (width, height) = _prepare_cover_inner_webp_frames(
+        cover_frames = _tensor_to_pil_frames(cover_tensor) if cover_tensor is not None else []
+        cover_image = cover_frames[0] if cover_frames else None
+        frames, _unused, (width, height) = _prepare_cover_inner_webp_frames(
             cover_image=cover_image,
             inner_frames=inner_frames,
-            cover_frame_count=表图连续帧数,
-            placeholder_color=表图占位颜色,
+            cover_frame_count=cover_count,
+            placeholder_color=placeholder_color,
         )
-        # 恢复原 Qt 工具的核心帧时序：表图帧极短，里图紧随其后。
-        # 单图里图只播放 1 轮并停在最终里图，避免表图/里图持续来回闪烁。
-        # 多帧里图使用最大有限循环次数 65535，而不是 loop=0 无限循环。
-        cover_count = max(1, int(表图连续帧数))
-        durations = ([1] * cover_count) + inner_durations
-        output_loop_count = 1 if len(inner_frames) <= 1 else 65535
 
-        filename_prefix = 文件名前缀 + self.prefix_append
+        # GIF 节点按样例结构写入 3 帧前缀：
+        # - 第 1 帧完整表图 1 ms
+        # - 第 2、3 帧极小占位差异帧各 1 ms
+        # - 第 4 帧开始为里图动画
+        # 同时保持 65535 次循环，不使用 0 ms / loop=0 方案。
+        durations = ([1] * cover_count) + list(inner_durations)
+        output_loop_count = 65535
+
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
-            filename_prefix, self.output_dir, width, height
+            filename_prefix + self.prefix_append, self.output_dir, width, height
         )
         os.makedirs(full_output_folder, exist_ok=True)
 
         selected_metadata, marker, native_prompt, native_extra_pnginfo = _build_webp_metadata_payload(
-            metadata_source=元数据来源,
-            source_image_filename=里图文件名缓存,
-            cover_frame_count=表图连续帧数,
+            metadata_source=metadata_source,
+            source_image_filename=source_filename,
+            cover_frame_count=cover_count,
             inner_frame_count=len(inner_frames),
             prompt=prompt,
             extra_pnginfo=extra_pnginfo,
+            media_type_override="animation_batch",
         )
+        marker["hbe_animation_fps"] = float(fps)
+        marker["hbe_animation_frame_duration_ms"] = int(frame_duration_ms)
         marker["hbe_inner_effective_durations_ms"] = [int(v) for v in inner_durations]
-        marker["hbe_playback_speed_multiplier"] = float(播放速度倍率)
-        marker["hbe_frame_sample_step"] = int(动画抽帧步长)
-        marker["hbe_inherit_gif_timing"] = bool(继承GIF原始帧时长)
-        marker["hbe_cover_mode"] = "first_frame_poster"
-        marker["hbe_animation_loop"] = 0
-        # marker 变更后重新生成 native extra，确保 WebP 内记录的是实际写出的帧结构。
+        marker["hbe_min_effective_inner_frames"] = int(min_effective_inner_frames)
+        marker["hbe_inner_frame_count_after_repeat"] = int(len(inner_frames))
+        marker["hbe_transport_min_size_kib"] = int(transport_min_kib)
+        marker["hbe_transport_padding_mode"] = "riff_unknown_chunk_HBEF" if transport_min_kib > 0 else "disabled"
+        marker["hbe_frame_sample_step"] = int(sample_step)
+        marker["hbe_animation_loop"] = int(output_loop_count)
+        marker["hbe_cover_frame_duration_ms"] = 1
+        marker["hbe_cover_mode"] = "full_cover_then_two_tiny_placeholder_frames"
+        marker["hbe_playback_policy"] = "sample_matched_3_prefix_frames_animation_batch"
+        marker["hbe_timing_source"] = "fixed_fps_from_image_batch"
+
         native_prompt, native_extra_pnginfo = _metadata_to_native_prompt_and_extra(selected_metadata, marker=marker)
         native_exif = _build_native_comfy_webp_exif(
-            frames[0],
-            prompt=native_prompt,
-            extra_pnginfo=native_extra_pnginfo,
+            frames[0], prompt=native_prompt, extra_pnginfo=native_extra_pnginfo
         )
-        extra_save_kwargs = {"exif": native_exif}
+
+        file = f"{filename}_{counter:05}_.webp"
+        out_path = os.path.join(full_output_folder, file)
+        _save_frames_as_webp(
+            frames=frames,
+            durations=durations,
+            out_path=out_path,
+            quality=quality,
+            lossless=lossless,
+            extra_save_kwargs={"exif": native_exif, "method": 4, "exact": False},
+            loop_count=output_loop_count,
+            preserve_duplicate_frames=True,
+            verify_saved=False,
+        )
+
+        encoded_size_before_padding = os.path.getsize(out_path)
+        final_size_bytes = _pad_webp_riff_to_min_size(
+            out_path, transport_min_kib * 1024
+        ) if transport_min_kib > 0 else encoded_size_before_padding
+        native_metadata = {}
+        preview_ref = _build_ui_preview_image_result(cover, preview_prefix="ComfyUI_hbe_overlay_preview")
+        ui_result = {
+            **preview_ref,
+            "saved_filename": file,
+            "saved_subfolder": subfolder,
+            "saved_type": self.type,
+            "metadata_source": metadata_source,
+            "inner_start_frame": int(marker.get("hbe_inner_start_frame", cover_count + 1)),
+            "fps": float(fps),
+            "loop": int(output_loop_count),
+            "encoded_size_before_padding": int(encoded_size_before_padding),
+            "final_size_bytes": int(final_size_bytes),
+            "transport_min_kib": int(transport_min_kib),
+            "comfyui_webp_metadata_keys": sorted(native_extra_pnginfo.keys()) if isinstance(native_extra_pnginfo, dict) else [],
+            "drag_workflow_ready": bool((native_extra_pnginfo or {}).get("workflow")) if isinstance(native_extra_pnginfo, dict) else False,
+        }
+        if selected_metadata:
+            ui_result["source_metadata_keys"] = sorted(selected_metadata.keys())
+
+        return {
+            "ui": {"images": [ui_result]},
+            "result": (_pil_frames_to_image_batch([frames[0]]), out_path),
+        }
+
+
+class SaveCoverInnerOverlayMerged:
+    """统一表里叠图节点：可输出 PNG(APNG) 或 WebP，默认 PNG。"""
+
+    OUTPUT_NODE = True
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "里图": ("IMAGE", {
+                    "tooltip": "仅支持单张静态图片。输出格式可选 PNG(APNG) 或 WebP。",
+                }),
+                "输出格式": (["PNG", "WEBP"], {
+                    "default": "PNG",
+                    "tooltip": "PNG：输出 APNG，默认图像为表图，点击查看进入里图；WEBP：输出表里叠图 WebP。",
+                }),
+                "表图占位颜色": ("STRING", {
+                    "default": "#FFFFFF", "multiline": False,
+                    "tooltip": "当表图输入未连接时，自动使用该纯色作为表图占位。",
+                }),
+                "发送兼容最小体积(KiB)": ("INT", {
+                    "default": 2304, "min": 0, "max": 262144, "step": 1,
+                    "tooltip": "PNG/APNG 与单图 WebP 共用的发送兼容体积阈值。若输出文件小于该体积，会追加不会影响显示的容器填充，以更稳定触发“文件发送时显示表图，点击查看时显示里图”的行为。填 0 表示禁用。",
+                }),
+                "WebP质量": ("INT", {
+                    "default": 82, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "仅对 WEBP 生效。PNG 模式下会自动隐藏。",
+                }),
+                "无损": ("BOOLEAN", {
+                    "default": False, "label_on": "开启无损", "label_off": "关闭无损",
+                }),
+                "元数据来源": (["图片内置元数据", "当前工作流元数据", "不保存元数据"], {
+                    "default": "图片内置元数据",
+                    "tooltip": "图片内置元数据：读取里图源文件元数据；当前工作流元数据：使用 ComfyUI 当前执行工作流。",
+                }),
+                "文件名前缀": ("STRING", {"default": "ComfyUI_cover_inner_overlay"}),
+                "自定义输出目录": ("STRING", {
+                    "default": "", "multiline": False,
+                    "tooltip": "留空时保存到 ComfyUI 默认输出目录。支持相对路径、Windows 盘符路径与 UNC 路径。",
+                }),
+                "里图文件名缓存": ("STRING", {
+                    "default": "", "multiline": False,
+                    "tooltip": "由前端自动写入并始终隐藏，用于“图片内置元数据”模式。",
+                }),
+            },
+            "optional": {
+                "表图": ("IMAGE",),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("图像", "文件路径")
+    FUNCTION = "save_overlay"
+    CATEGORY = "图像/保存"
+    DESCRIPTION = "Unified cover-inner overlay merge node. Outputs PNG(APNG) or WebP, default PNG. Includes color picker, workflow metadata saving, 2304 KiB transport padding, and compatibility with both classic ComfyUI and Nodes 2.0."
+
+    def save_overlay(self, 里图, 输出格式="PNG", 表图占位颜色="#FFFFFF",
+                     发送兼容最小体积_KiB=2304, WebP质量=82, 无损=False, 元数据来源="图片内置元数据",
+                     文件名前缀="ComfyUI_cover_inner_overlay", 自定义输出目录="", 里图文件名缓存="", 表图=None,
+                     prompt=None, extra_pnginfo=None, **kwargs):
+        if "发送兼容最小体积(KiB)" in kwargs:
+            发送兼容最小体积_KiB = kwargs.get("发送兼容最小体积(KiB)", 发送兼容最小体积_KiB)
+
+        fmt = str(输出格式 or "PNG").strip().upper()
+        if fmt not in {"PNG", "WEBP"}:
+            fmt = "PNG"
+
+        self.output_dir = _normalize_output_directory(自定义输出目录, folder_paths.get_output_directory())
+        inner_frames = _tensor_to_pil_frames(里图)
+        if len(inner_frames) != 1:
+            raise ValueError(
+                f'“表里叠图合并节点”只处理单张静态图片；检测到 {len(inner_frames)} 帧。'
+                '若是 IMAGE Batch / GIF 帧序列，请继续使用“表里GIF合并编辑器”。'
+            )
+
+        inner_image = inner_frames[0].convert("RGBA")
+        target_size = inner_image.size
+        cover_frames = _tensor_to_pil_frames(表图) if 表图 is not None else []
+        cover_image = cover_frames[0] if cover_frames else None
+        if cover_image is None:
+            rgba = _parse_hex_color(表图占位颜色, (255, 255, 255, 255))
+            cover = Image.new("RGBA", target_size, rgba)
+        else:
+            cover = _crop_to_canvas(cover_image, target_size)
+
+        filename_prefix = 文件名前缀 + self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir, target_size[0], target_size[1]
+        )
+        os.makedirs(full_output_folder, exist_ok=True)
+
+        # 单图统一使用两张几乎相同的里图帧，避免部分前端/客户端把它当作普通静态图处理。
+        inner_anim_frames = [inner_image, _make_distinct_duplicate_frame(inner_image, 1)]
+
+        min_size_bytes = max(0, int(发送兼容最小体积_KiB or 0)) * 1024
+
+        if fmt == "PNG":
+            frame_duration_ms = 100
+            durations = [frame_duration_ms, frame_duration_ms]
+            selected_metadata, marker, native_prompt, native_extra_pnginfo = _build_webp_metadata_payload(
+                metadata_source=元数据来源,
+                source_image_filename=里图文件名缓存,
+                cover_frame_count=1,
+                inner_frame_count=len(inner_anim_frames),
+                prompt=prompt,
+                extra_pnginfo=extra_pnginfo,
+                media_type_override="image",
+                source_ext_override=".png",
+            )
+            marker["hbe_container_type"] = "apng"
+            marker["hbe_inner_effective_durations_ms"] = [int(v) for v in durations]
+            marker["hbe_cover_mode"] = "png_default_image_cover"
+            marker["hbe_animation_loop"] = 0
+            marker["hbe_playback_policy"] = "apng_default_image_then_two_inner_frames"
+            marker["hbe_transport_padding_mode"] = "png_ancillary_chunk_hbEf" if min_size_bytes > 0 else "disabled"
+            native_prompt, native_extra_pnginfo = _metadata_to_native_prompt_and_extra(selected_metadata, marker=marker)
+            pnginfo = _build_native_pnginfo_from_prompt_extra(
+                prompt=native_prompt,
+                extra_pnginfo=native_extra_pnginfo,
+            )
+
+            file = f"{filename}_{counter:05}_.png"
+            out_path = os.path.join(full_output_folder, file)
+            _save_frames_as_apng(
+                default_image=cover,
+                frames=inner_anim_frames,
+                durations=durations,
+                out_path=out_path,
+                pnginfo=pnginfo,
+                loop_count=0,
+            )
+            final_size = _pad_png_to_min_size(out_path, min_size_bytes)
+
+            preview_ref = _build_ui_preview_image_result(cover, preview_prefix="ComfyUI_hbe_overlay_preview")
+            ui_result = {
+                **preview_ref,
+                "saved_filename": file,
+                "saved_subfolder": subfolder,
+                "saved_type": self.type,
+                "output_format": "PNG",
+                "metadata_source": 元数据来源,
+                "default_image_cover": True,
+                "animated_inner_frame_count": len(inner_anim_frames),
+                "frame_duration_ms": int(frame_duration_ms),
+                "final_size_bytes": int(final_size),
+                "transport_min_size_kib": int(发送兼容最小体积_KiB or 0),
+                "drag_workflow_ready": bool((native_extra_pnginfo or {}).get("workflow")) if isinstance(native_extra_pnginfo, dict) else False,
+                "comfyui_png_metadata_keys": sorted(native_extra_pnginfo.keys()) if isinstance(native_extra_pnginfo, dict) else [],
+            }
+            if selected_metadata:
+                ui_result["source_metadata_keys"] = sorted(selected_metadata.keys())
+
+            preview_frames = [cover] + inner_anim_frames
+            return {
+                "ui": {"images": [ui_result]},
+                "result": (_pil_frames_to_image_batch(preview_frames), out_path),
+            }
+
+        # WEBP 单图模式
+        cover_count = 2
+        frames = []
+        for i in range(cover_count):
+            frames.append(cover.copy() if i == 0 else _make_distinct_duplicate_frame(cover, i))
+        frames.extend(inner_anim_frames)
+        effective_inner_durations = [600_000, 600_000]
+        durations = ([1] * cover_count) + effective_inner_durations
+        output_loop_count = 1
+
+        selected_metadata, marker, native_prompt, native_extra_pnginfo = _build_webp_metadata_payload(
+            metadata_source=元数据来源,
+            source_image_filename=里图文件名缓存,
+            cover_frame_count=cover_count,
+            inner_frame_count=len(inner_anim_frames),
+            prompt=prompt,
+            extra_pnginfo=extra_pnginfo,
+            media_type_override="image",
+        )
+        marker["hbe_inner_effective_durations_ms"] = effective_inner_durations
+        marker["hbe_cover_mode"] = "first_frame_poster"
+        marker["hbe_animation_loop"] = int(output_loop_count)
+        marker["hbe_playback_policy"] = "static_cover_then_two_inner_frames"
+        marker["hbe_transport_padding_mode"] = "riff_unknown_chunk_HBEF" if min_size_bytes > 0 else "disabled"
+        native_prompt, native_extra_pnginfo = _metadata_to_native_prompt_and_extra(selected_metadata, marker=marker)
+        native_exif = _build_native_comfy_webp_exif(
+            frames[0], prompt=native_prompt, extra_pnginfo=native_extra_pnginfo
+        )
 
         file = f"{filename}_{counter:05}_.webp"
         out_path = os.path.join(full_output_folder, file)
@@ -1395,23 +1890,26 @@ class SaveCoverInnerWebPWithSourceWorkflow:
             out_path=out_path,
             quality=WebP质量,
             lossless=无损,
-            extra_save_kwargs=extra_save_kwargs,
+            extra_save_kwargs={"exif": native_exif},
             loop_count=output_loop_count,
         )
+        final_size = _pad_webp_riff_to_min_size(out_path, min_size_bytes)
 
-        # 使用与 ComfyUI frontend getWebpMetadata() 同规则的原始 RIFF/EXIF 解析器自检。
-        # 只有这样才能确认“Pillow 能读取”与“ComfyUI 拖入画布能读取”是同一件事。
-        native_metadata = _verify_comfy_webp_drag_metadata(out_path)
-
+        preview_ref = _build_ui_preview_image_result(cover, preview_prefix="ComfyUI_hbe_overlay_preview")
         ui_result = {
-            "filename": file,
-            "subfolder": subfolder,
-            "type": self.type,
+            **preview_ref,
+            "saved_filename": file,
+            "saved_subfolder": subfolder,
+            "saved_type": self.type,
+            "output_format": "WEBP",
+            "metadata_source": 元数据来源,
+            "inner_start_frame": int(marker.get("hbe_inner_start_frame", cover_count + 1)),
+            "animated_inner_frame_count": len(inner_anim_frames),
+            "final_size_bytes": int(final_size),
+            "transport_min_size_kib": int(发送兼容最小体积_KiB or 0),
+            "drag_workflow_ready": bool((native_extra_pnginfo or {}).get("workflow")) if isinstance(native_extra_pnginfo, dict) else False,
+            "comfyui_webp_metadata_keys": sorted(native_extra_pnginfo.keys()) if isinstance(native_extra_pnginfo, dict) else [],
         }
-        ui_result["metadata_source"] = 元数据来源
-        ui_result["inner_start_frame"] = int(marker.get("hbe_inner_start_frame", 表图连续帧数 + 1))
-        ui_result["comfyui_webp_metadata_keys"] = sorted(native_metadata.keys())
-        ui_result["drag_workflow_ready"] = bool(native_metadata.get("workflow"))
         if selected_metadata:
             ui_result["source_metadata_keys"] = sorted(selected_metadata.keys())
 
@@ -1421,14 +1919,14 @@ class SaveCoverInnerWebPWithSourceWorkflow:
         }
 
 
-class ReadWebPInnerImage:
+class ReadInnerImage:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "WebP文件": (_list_available_webp_images(), {
+                "图片文件": (_list_available_webp_images(), {
                     "image_upload": True,
-                    "tooltip": "选择或上传由“表里图合并编辑器”生成的 WebP。节点只输出其中标记的里图帧。",
+                    "tooltip": "选择或上传由表里叠图节点生成的 WebP / PNG(APNG)。节点会自动判定容器并只输出其中标记的里图帧。",
                 }),
             }
         }
@@ -1437,29 +1935,30 @@ class ReadWebPInnerImage:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("里图",)
     FUNCTION = "load_inner_image"
-    DESCRIPTION = "读取由本插件生成的表里图 WebP，根据内嵌 HBE 标记自动截取里图帧。多帧里图会直接作为 IMAGE 图片组输出，因此 GIF/动画里图可以继续以批次形式处理。"
+    DESCRIPTION = "Read inner image from a generated WebP or PNG/APNG. The node automatically detects the container and extracts only the marked inner frames."
 
     @classmethod
-    def IS_CHANGED(cls, WebP文件):
-        path = _resolve_any_image_path(WebP文件)
+    def IS_CHANGED(cls, 图片文件):
+        path = _resolve_any_image_path(图片文件)
         if not path or not os.path.exists(path):
             return float("nan")
         return os.path.getmtime(path)
 
-    def load_inner_image(self, WebP文件):
-        resolved = _resolve_any_image_path(WebP文件)
+    def load_inner_image(self, 图片文件):
+        resolved = _resolve_any_image_path(图片文件)
         if not resolved:
-            raise FileNotFoundError(f"找不到 WebP 文件：{WebP文件}")
-        if os.path.splitext(resolved)[1].lower() != ".webp":
-            raise ValueError("“读取WebP里图”节点只接受 .webp 文件。")
+            raise FileNotFoundError(f"找不到图片文件：{图片文件}")
+        ext = os.path.splitext(resolved)[1].lower()
+        if ext not in {".webp", ".png"}:
+            raise ValueError("“读取里图节点”只接受 .webp 或 .png(APNG) 文件。")
 
         # 只读取一次元数据，再使用 ComfyUI 原生 LoadImage 解码像素/动画帧。
         metadata = _extract_metadata_from_image(resolved)
         info = _extract_cover_inner_info(metadata)
         if not info.get("has_marker"):
-            raise ValueError("该 WebP 不包含本插件的表里图标记，无法确定里图从哪一帧开始。")
+            raise ValueError("该 PNG/APNG 或 WebP 不包含本插件的表里图标记，无法确定里图范围。请确认文件由本插件的表里叠图节点生成。")
 
-        images, _masks = _load_image_tensors_with_comfy_native(WebP文件)
+        images, _masks = _load_image_tensors_with_comfy_native(图片文件)
         frame_count = int(images.shape[0]) if hasattr(images, "shape") and len(images.shape) > 0 else 1
 
         start_index = max(0, min(int(info.get("start_index", 0)), frame_count))
@@ -1468,7 +1967,7 @@ class ReadWebPInnerImage:
 
         if start_index >= end_index:
             raise ValueError(
-                f"WebP 中记录的里图范围无效：起始索引 {start_index}，总帧数 {frame_count}。"
+                f"图片中记录的里图范围无效：起始索引 {start_index}，总帧数 {frame_count}。"
             )
 
         # Tensor 切片是 view，不额外复制整批像素；多帧会直接作为 ComfyUI IMAGE 图片组输出。
@@ -1478,11 +1977,13 @@ class ReadWebPInnerImage:
 
 NODE_CLASS_MAPPINGS = {
     "HorizontalBandEditor": HorizontalBandEditor,
-    "SaveCoverInnerWebPWithSourceWorkflow": SaveCoverInnerWebPWithSourceWorkflow,
-    "ReadWebPInnerImage": ReadWebPInnerImage,
+    "SaveCoverInnerOverlayMerged": SaveCoverInnerOverlayMerged,
+    "SaveCoverInnerGifWebPFromBatch": SaveCoverInnerGifWebPFromBatch,
+    "ReadInnerImage": ReadInnerImage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "HorizontalBandEditor": "横向截断面板编辑器",
-    "SaveCoverInnerWebPWithSourceWorkflow": "表里图合并编辑器",
-    "ReadWebPInnerImage": "读取WebP里图",
+    "HorizontalBandEditor": "Horizontal Band Editor",
+    "SaveCoverInnerOverlayMerged": "Cover-Inner Overlay Merge",
+    "SaveCoverInnerGifWebPFromBatch": "Cover-Inner GIF Merge",
+    "ReadInnerImage": "Read Inner Image",
 }
