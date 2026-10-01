@@ -1740,7 +1740,7 @@ class SaveCoverInnerGifWebPFromBatch:
             out_path, transport_min_kib * 1024
         ) if transport_min_kib > 0 else encoded_size_before_padding
         native_metadata = {}
-        preview_ref = _build_ui_preview_image_result(cover, preview_prefix="ComfyUI_hbe_overlay_preview")
+        preview_ref = _build_ui_preview_image_result(frames[0], preview_prefix="ComfyUI_hbe_gif_preview")
         ui_result = {
             **preview_ref,
             "saved_filename": file,
