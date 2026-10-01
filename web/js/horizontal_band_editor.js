@@ -275,19 +275,59 @@ function repairLegacyColorPickerWidgetValues(node, config) {
 
 function getConnectedLoadImageByInputNames(node, inputNames) {
     if (!node?.inputs?.length || !app.graph) return null;
-    for (const input of node.inputs) {
-        if (!input || !inputNames.includes(input.name) || input.link == null) continue;
-        const link = app.graph.links?.[input.link];
-        const upstream = link?.origin_id != null ? app.graph.getNodeById?.(link.origin_id) : null;
-        if (!upstream) continue;
-        const imageWidget = upstream.widgets?.find((w) => w.name === "image");
-        if (imageWidget?.value) {
+
+    const getUpstream = (linkId) => {
+        if (linkId == null) return null;
+        const link = app.graph.links?.[linkId];
+        return link?.origin_id != null ? app.graph.getNodeById?.(link.origin_id) : null;
+    };
+
+    const makeResultIfLoader = (candidate) => {
+        if (!candidate) return null;
+        const comfyClass = String(candidate.comfyClass || candidate.type || "");
+        const imageWidget = candidate.widgets?.find((w) => w.name === "image");
+        // 原生 LoadImage 的类型名稳定为 LoadImage。部分兼容前端可能只保留 type，
+        // 因此同时检查 comfyClass/type；不依赖中文/英文显示标题。
+        if ((comfyClass === "LoadImage" || comfyClass.endsWith("/LoadImage")) && imageWidget?.value) {
             return {
                 filename: String(imageWidget.value),
-                title: upstream.title || upstream.type || "加载图像",
-                upstream,
+                title: candidate.title || candidate.type || "Load Image",
+                upstream: candidate,
                 imageWidget,
             };
+        }
+        return null;
+    };
+
+    // 先锁定“里图/输入图像”这条连接，再沿它向上广度优先寻找最近的 LoadImage。
+    // 这样里图即使经过编辑、裁剪、缩放等中间节点，也仍可继承最接近的源图工作流。
+    const roots = [];
+    for (const input of node.inputs) {
+        if (!input || !inputNames.includes(input.name) || input.link == null) continue;
+        const upstream = getUpstream(input.link);
+        if (upstream) roots.push(upstream);
+    }
+    if (!roots.length) return null;
+
+    const queue = roots.map((upstream) => ({ upstream, depth: 0 }));
+    const seen = new Set();
+    const MAX_DEPTH = 24;
+
+    while (queue.length) {
+        const { upstream, depth } = queue.shift();
+        if (!upstream || seen.has(upstream.id) || depth > MAX_DEPTH) continue;
+        seen.add(upstream.id);
+
+        const loader = makeResultIfLoader(upstream);
+        if (loader) return loader;
+
+        for (const input of upstream.inputs || []) {
+            if (!input || input.link == null) continue;
+            // 优先沿 IMAGE/MASK 传播链追踪；未知类型也允许继续，以兼容部分自定义节点。
+            const type = String(input.type || "").toUpperCase();
+            if (type && !["IMAGE", "MASK", "*"].includes(type)) continue;
+            const parent = getUpstream(input.link);
+            if (parent && !seen.has(parent.id)) queue.push({ upstream: parent, depth: depth + 1 });
         }
     }
     return null;

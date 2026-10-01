@@ -3,6 +3,7 @@ import os
 import struct
 import zlib
 from types import SimpleNamespace
+from pathlib import Path
 from typing import List, Tuple
 from xml.etree import ElementTree as ET
 
@@ -580,7 +581,13 @@ def _extract_metadata_from_image(path: str):
         return {}
     try:
         with Image.open(resolved) as img:
-            return _extract_metadata_from_open_image(img, resolved)
+            metadata = _extract_metadata_from_open_image(img, resolved)
+        # APNG 的文本元数据可能被放在动画数据之后。Pillow 初次 open 时不一定已经
+        # 扫描到尾部，因此额外从原始 PNG chunk 中读取并合并，保证 hbe/workflow 可用。
+        if os.path.splitext(resolved)[1].lower() == ".png":
+            for key, value in _parse_png_text_chunks_raw(resolved).items():
+                _store_metadata_value(metadata, key, value)
+        return metadata
     except Exception:
         return {}
 
@@ -819,6 +826,10 @@ def _clean_metadata_for_embedding(metadata: dict):
         if key == "hbe" or key.startswith("hbe_"):
             continue
         if key in {"_gif_durations_ms", "_gif_loop"}:
+            continue
+        # Pillow 会把 APNG 运行时状态放进 image.info；这些不是 ComfyUI 工作流元数据，
+        # 继承源图时不应被再次写成 tEXt。
+        if key in {"loop", "default_image", "duration", "disposal", "blend", "background", "transparency"}:
             continue
         cleaned[key] = value
     return cleaned
@@ -1175,59 +1186,127 @@ def _pad_webp_riff_to_min_size(path: str, min_size_bytes: int) -> int:
 
 def _pad_png_to_min_size(path: str, min_size_bytes: int) -> int:
     """
-    在 PNG/APNG 的 IEND 前插入一个私有的 ancillary chunk（hbEf）作为兼容填充。
+    使用标准 PNG tEXt chunk 将 PNG/APNG 补到指定最小体积。
 
-    这样不会改变可见像素、不会改变 APNG 帧结构，但可以把文件体积稳定推到
-    某些聊天软件更容易走“文件缩略图/点击查看原图”路径的阈值以上。
+    旧实现使用私有 hbEf ancillary chunk。实际测试发现部分聊天软件在决定
+    “直接显示动画/里图”还是“缩略表图 + 点击查看原图”时，会忽略未知私有 chunk，
+    因而文件物理大小虽然达到阈值，客户端看到的有效 PNG 体积仍然不足。
+
+    新实现写入未压缩标准 tEXt，并插入到 acTL（或首个 IDAT）之前。这样填充
+    会作为标准 PNG 元数据参与目标客户端的 PNG 解析，同时不改变任何像素、APNG
+    帧、duration、loop 或 default_image。关键字以 hbe_ 开头，重新继承元数据时会
+    被 _clean_metadata_for_embedding() 自动过滤，不会递归膨胀。
     """
     min_size_bytes = max(0, int(min_size_bytes or 0))
     if min_size_bytes <= 0:
         return os.path.getsize(path)
 
-    with open(path, 'rb') as f:
-        data = bytearray(f.read())
-
+    data = Path(path).read_bytes()
     if len(data) < 12 or data[:8] != b'\x89PNG\r\n\x1a\n':
         raise RuntimeError('兼容填充失败：输出文件不是有效的 PNG/APNG。')
 
     if len(data) >= min_size_bytes:
         return len(data)
 
-    # 查找 IEND chunk 起点。
+    # 优先放在 acTL 之前，使文件头与“带 prompt/workflow 的已验证可用 APNG”一致。
+    # 普通 PNG 没有 acTL 时则放到第一个 IDAT 之前。
     pos = 8
-    iend_pos = None
+    insert_pos = None
     while pos + 12 <= len(data):
         length = int.from_bytes(data[pos:pos+4], 'big', signed=False)
         ctype = data[pos+4:pos+8]
         next_pos = pos + 12 + length
         if next_pos > len(data):
             break
-        if ctype == b'IEND':
-            iend_pos = pos
+        if ctype in {b'acTL', b'IDAT', b'IEND'}:
+            insert_pos = pos
             break
         pos = next_pos
+    if insert_pos is None:
+        raise RuntimeError('兼容填充失败：找不到 acTL / IDAT / IEND 插入位置。')
 
-    if iend_pos is None:
-        raise RuntimeError('兼容填充失败：找不到 IEND chunk。')
+    keyword = b'hbe_transport_padding'
+    fixed_overhead = 12 + len(keyword) + 1  # chunk framing + keyword + NUL
+    deficit = max(0, min_size_bytes - len(data))
+    text_len = max(1, deficit - fixed_overhead)
+    payload = keyword + b'\x00' + (b'P' * text_len)
 
-    # PNG chunk = length(4, big endian) + type(4) + data + crc(4)
-    payload_size = max(0, min_size_bytes - len(data) - 12)
-    ctype = b'hbEf'
-    payload = b'\x00' * payload_size
+    ctype = b'tEXt'
     crc = zlib.crc32(ctype)
     crc = zlib.crc32(payload, crc) & 0xffffffff
     chunk = bytearray()
-    chunk.extend(int(payload_size).to_bytes(4, 'big', signed=False))
+    chunk.extend(len(payload).to_bytes(4, 'big', signed=False))
     chunk.extend(ctype)
     chunk.extend(payload)
-    chunk.extend(int(crc).to_bytes(4, 'big', signed=False))
+    chunk.extend(crc.to_bytes(4, 'big', signed=False))
 
-    new_data = data[:iend_pos] + chunk + data[iend_pos:]
-    with open(path, 'wb') as f:
-        f.write(new_data)
+    new_data = data[:insert_pos] + chunk + data[insert_pos:]
+    Path(path).write_bytes(new_data)
     return len(new_data)
 
 
+
+def _parse_png_text_chunks_raw(path: str) -> dict:
+    """读取 PNG/APNG 任意位置的 tEXt / zTXt / iTXt 文本元数据。"""
+    result = {}
+    try:
+        data = Path(path).read_bytes()
+    except Exception:
+        return result
+    if len(data) < 8 or data[:8] != b'\x89PNG\r\n\x1a\n':
+        return result
+
+    pos = 8
+    while pos + 12 <= len(data):
+        length = int.from_bytes(data[pos:pos+4], 'big', signed=False)
+        ctype = data[pos+4:pos+8]
+        start = pos + 8
+        end = start + length
+        if end + 4 > len(data):
+            break
+        payload = data[start:end]
+        try:
+            if ctype == b'tEXt':
+                sep = payload.find(b'\x00')
+                if sep > 0:
+                    key = payload[:sep].decode('latin-1', errors='replace')
+                    value = payload[sep+1:].decode('latin-1', errors='replace')
+                    result[key] = value
+            elif ctype == b'zTXt':
+                sep = payload.find(b'\x00')
+                if sep > 0 and sep + 2 <= len(payload):
+                    key = payload[:sep].decode('latin-1', errors='replace')
+                    method = payload[sep+1]
+                    if method == 0:
+                        value = zlib.decompress(payload[sep+2:]).decode('latin-1', errors='replace')
+                        result[key] = value
+            elif ctype == b'iTXt':
+                sep = payload.find(b'\x00')
+                if sep > 0 and sep + 3 <= len(payload):
+                    key = payload[:sep].decode('latin-1', errors='replace')
+                    compression_flag = payload[sep+1]
+                    compression_method = payload[sep+2]
+                    cursor = sep + 3
+                    lang_end = payload.find(b'\x00', cursor)
+                    if lang_end < 0:
+                        raise ValueError('invalid iTXt language field')
+                    cursor = lang_end + 1
+                    translated_end = payload.find(b'\x00', cursor)
+                    if translated_end < 0:
+                        raise ValueError('invalid iTXt translated keyword field')
+                    cursor = translated_end + 1
+                    text_bytes = payload[cursor:]
+                    if compression_flag == 1:
+                        if compression_method != 0:
+                            raise ValueError('unsupported iTXt compression method')
+                        text_bytes = zlib.decompress(text_bytes)
+                    result[key] = text_bytes.decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        pos = end + 4
+        if ctype == b'IEND':
+            break
+    return result
 
 
 def _build_ui_preview_image_result(preview_image: Image.Image, preview_prefix: str = "ComfyUI_hbe_preview") -> dict:
@@ -1809,7 +1888,7 @@ class SaveCoverInnerOverlayMerged:
             marker["hbe_cover_mode"] = "png_default_image_cover"
             marker["hbe_animation_loop"] = 0
             marker["hbe_playback_policy"] = "apng_default_image_then_two_inner_frames"
-            marker["hbe_transport_padding_mode"] = "png_ancillary_chunk_hbEf" if min_size_bytes > 0 else "disabled"
+            marker["hbe_transport_padding_mode"] = "png_standard_tEXt_before_acTL" if min_size_bytes > 0 else "disabled"
             native_prompt, native_extra_pnginfo = _metadata_to_native_prompt_and_extra(selected_metadata, marker=marker)
             pnginfo = _build_native_pnginfo_from_prompt_extra(
                 prompt=native_prompt,
